@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# secrets and local data, never commit
+.env
+.env.*
+!.env.example
+*.p8
+*.pem
+*.key
+data/
+*.sqlite
+*.sqlite-*
