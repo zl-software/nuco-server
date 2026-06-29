@@ -1,0 +1,7 @@
+# Caddy reverse proxy with automatic TLS. Replace the domain with yours. Caddy obtains and
+# renews the certificate and upgrades the WebSocket transparently, so the relay itself runs
+# plain on the internal network.
+
+relay.nuco-messenger.com {
+	reverse_proxy relay:8787
+}

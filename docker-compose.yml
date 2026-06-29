@@ -1,0 +1,46 @@
+# Run the Nuco relay with TLS terminated by Caddy (automatic Let's Encrypt). Clone the
+# protocol and nuco-server repos side by side, then from the nuco-server folder run:
+#   docker compose up -d
+# Point the app's custom server setting at wss://your-domain.
+#
+# The build context is the parent folder so the shared protocol package is included.
+
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: nuco-server/Dockerfile
+    restart: unless-stopped
+    environment:
+      - RELAY_HOST=0.0.0.0
+      - RELAY_PORT=8787
+      - RELAY_SQLITE_PATH=/data/nuco.sqlite
+      # iOS push (optional). Mount your .p8 below and fill these in to enable APNs.
+      # - APNS_KEY_PATH=/secrets/AuthKey.p8
+      # - APNS_KEY_ID=ABC123DEFG
+      # - APNS_TEAM_ID=TEAM123456
+      # - APNS_BUNDLE_ID=com.zlsoftware.nuco
+      # - APNS_HOST=api.push.apple.com
+    volumes:
+      - relay-data:/data
+      # - ./secrets/AuthKey.p8:/secrets/AuthKey.p8:ro
+    expose:
+      - '8787'
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - relay
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:
