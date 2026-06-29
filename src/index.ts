@@ -9,6 +9,8 @@ import { loadConfig } from './config.js';
 import { SqliteStorage } from './storage/sqlite.js';
 import { PushFanout } from './push/sender.js';
 import { MockPushSender } from './push/mock.js';
+import { ApnsPushSender } from './push/apns.js';
+import { UnifiedPushSender } from './push/unifiedpush.js';
 import { RelayServer } from './ws/server.js';
 import { createServer } from './http/server.js';
 
@@ -20,10 +22,12 @@ function main(): void {
   }
   const storage = new SqliteStorage(config.sqlitePath);
 
-  // Real APNs and UnifiedPush senders are wired in the push milestone. In dev mode (or
-  // when no push credentials are configured) the relay logs the wake instead of sending.
-  const mock = config.dev || !config.apns ? new MockPushSender() : null;
-  const fanout = new PushFanout(null, null, mock);
+  // In dev mode the relay logs the wake instead of sending. In production it sends APNs (if
+  // a .p8 is configured) and UnifiedPush directly.
+  const mock = config.dev ? new MockPushSender() : null;
+  const apns = config.apns ? new ApnsPushSender(config.apns) : null;
+  const unifiedPush = new UnifiedPushSender();
+  const fanout = new PushFanout(apns, unifiedPush, mock);
 
   const httpServer = createServer(config);
   const relay = new RelayServer(config, storage, fanout);
