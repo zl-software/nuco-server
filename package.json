@@ -8,8 +8,9 @@
   "scripts": {
     "dev": "RELAY_DEV=1 tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/storage && cp src/storage/schema.sql dist/storage/schema.sql",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx test/ws-smoke.ts",
     "test:e2e": "tsx test/e2e.ts"
   },
   "dependencies": {
