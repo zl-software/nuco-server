@@ -105,6 +105,7 @@ function dispatch(ctx: RelayContext, session: Session, msg: ClientMessage): void
         createdAt: existing?.createdAt ?? now,
         lastSeen: now,
       });
+      if (ctx.config.dev) console.log(`[relay] registered ${session.handle}`);
       session.send({ type: 'ok', rid: msg.rid });
       return;
     }
@@ -126,6 +127,7 @@ function dispatch(ctx: RelayContext, session: Session, msg: ClientMessage): void
       session.authenticated = true;
       ctx.bind(session.handle, session);
       ctx.storage.touchDevice(session.handle, ctx.now());
+      if (ctx.config.dev) console.log(`[relay] authenticated ${session.handle}`);
       session.send({ type: 'authenticated' });
       deliverQueued(ctx, session);
       return;

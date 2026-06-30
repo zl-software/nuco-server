@@ -34,6 +34,7 @@ export class RelayServer implements RelayContext {
     this.wss = new WebSocketServer({ server, maxPayload: this.config.maxMessageBytes + 8192 });
     this.wss.on('connection', (ws, req) => {
       const ip = (req.socket.remoteAddress ?? 'unknown').toString();
+      if (this.config.dev) console.log(`[relay] socket connected from ${ip}`);
       const session = new Session(ws, ip);
       this.sessions.add(session);
       ws.on('message', (data, isBinary) => {
@@ -47,6 +48,7 @@ export class RelayServer implements RelayContext {
         session.alive = true;
       });
       ws.on('close', () => {
+        if (this.config.dev) console.log(`[relay] socket closed from ${ip}`);
         this.sessions.delete(session);
         this.unbind(session);
       });
