@@ -35,6 +35,9 @@ export interface Storage {
   // Drop a device's push route (e.g. after APNs reports the token is no longer registered),
   // so the relay stops sending wakes to a dead token. The account itself is kept.
   clearPush(handle: string): void;
+  // Delete an account and all of its server side data: the device record, its prekeys, and any
+  // messages queued for it. Used for in app account deletion.
+  deleteAccount(handle: string): void;
   touchDevice(handle: string, now: number): void;
 
   // Prekeys.

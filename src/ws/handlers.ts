@@ -223,5 +223,15 @@ function dispatch(ctx: RelayContext, session: Session, msg: ClientMessage): void
       session.send({ type: 'pong', ts: msg.ts });
       return;
     }
+
+    case 'deregister': {
+      if (!requireAuth(session, msg.rid)) return;
+      ctx.storage.deleteAccount(session.handle!);
+      // The account no longer exists on this socket; drop its authenticated state.
+      session.authenticated = false;
+      if (ctx.config.dev) console.log(`[relay] deregistered ${session.handle}`);
+      session.send({ type: 'ok', rid: msg.rid });
+      return;
+    }
   }
 }

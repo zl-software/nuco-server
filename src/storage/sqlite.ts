@@ -112,6 +112,16 @@ export class SqliteStorage implements Storage {
       .run(handle);
   }
 
+  deleteAccount(handle: string): void {
+    const tx = this.db.transaction(() => {
+      // Messages queued for this recipient have no FK to devices, so remove them explicitly.
+      this.db.prepare('DELETE FROM queued_messages WHERE recipient = ?').run(handle);
+      // Deleting the device cascades to signed_prekeys and onetime_prekeys (ON DELETE CASCADE).
+      this.db.prepare('DELETE FROM devices WHERE handle = ?').run(handle);
+    });
+    tx();
+  }
+
   touchDevice(handle: string, now: number): void {
     this.db.prepare('UPDATE devices SET last_seen = ? WHERE handle = ?').run(now, handle);
   }
