@@ -117,6 +117,11 @@ class Client {
     this.send({ type: 'connect', protocolVersion: PROTOCOL_VERSION, handle: this.handle });
     const c = await connected;
     if (c.type !== 'connected') throw new Error('connect failed');
+    if (c.protocolVersion.major !== PROTOCOL_VERSION.major || c.protocolVersion.minor !== PROTOCOL_VERSION.minor) {
+      throw new Error(
+        `connected reply version ${c.protocolVersion.major}.${c.protocolVersion.minor} != relay ${PROTOCOL_VERSION.major}.${PROTOCOL_VERSION.minor}`,
+      );
+    }
     await this.request((rid) => ({
       type: 'register',
       rid,

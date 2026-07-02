@@ -5,6 +5,7 @@ import {
   ErrorCode,
   isMajorCompatible,
   parseClientMessage,
+  PROTOCOL_VERSION,
   type ClientMessage,
   type MessageEnvelope,
 } from '@nuco/protocol';
@@ -75,9 +76,12 @@ function dispatch(ctx: RelayContext, session: Session, msg: ClientMessage): void
       }
       session.handle = msg.handle;
       session.challenge = makeChallenge();
+      // Reply with the relay's own version (major already checked compatible), not the
+      // client's echoed version, so the client can discover the relay's minor for feature
+      // negotiation.
       session.send({
         type: 'connected',
-        protocolVersion: { major: msg.protocolVersion.major, minor: msg.protocolVersion.minor },
+        protocolVersion: { major: PROTOCOL_VERSION.major, minor: PROTOCOL_VERSION.minor },
         challenge: session.challenge,
       });
       return;
@@ -125,6 +129,8 @@ function dispatch(ctx: RelayContext, session: Session, msg: ClientMessage): void
         return;
       }
       session.authenticated = true;
+      // The challenge is a one time nonce; drop it once consumed.
+      session.challenge = null;
       ctx.bind(session.handle, session);
       ctx.storage.touchDevice(session.handle, ctx.now());
       if (ctx.config.dev) console.log(`[relay] authenticated ${session.handle}`);
