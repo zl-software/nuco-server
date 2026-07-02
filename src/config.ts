@@ -71,16 +71,31 @@ export function loadConfig(): Config {
   const tls = !dev && tlsCert && tlsKey ? { cert: tlsCert, key: tlsKey } : null;
 
   const apnsKeyPath = optStr('APNS_KEY_PATH');
-  const apns: ApnsConfig | null =
-    !dev && apnsKeyPath
-      ? {
-          keyPath: apnsKeyPath,
-          keyId: str('APNS_KEY_ID', ''),
-          teamId: str('APNS_TEAM_ID', ''),
-          bundleId: str('APNS_BUNDLE_ID', ''),
-          host: str('APNS_HOST', 'api.push.apple.com'),
-        }
-      : null;
+  let apns: ApnsConfig | null = null;
+  if (!dev && apnsKeyPath) {
+    // Fail fast on a partial APNs config: empty key id / team id / bundle id would produce
+    // JWTs that APNs silently rejects, turning every push into a dead end with no signal.
+    const keyId = optStr('APNS_KEY_ID');
+    const teamId = optStr('APNS_TEAM_ID');
+    const bundleId = optStr('APNS_BUNDLE_ID');
+    const missing = [
+      ['APNS_KEY_ID', keyId],
+      ['APNS_TEAM_ID', teamId],
+      ['APNS_BUNDLE_ID', bundleId],
+    ]
+      .filter(([, v]) => !v)
+      .map(([name]) => name);
+    if (missing.length > 0) {
+      throw new Error(`APNS_KEY_PATH is set but ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing`);
+    }
+    apns = {
+      keyPath: apnsKeyPath,
+      keyId: keyId!,
+      teamId: teamId!,
+      bundleId: bundleId!,
+      host: str('APNS_HOST', 'api.push.apple.com'),
+    };
+  }
 
   return {
     dev,

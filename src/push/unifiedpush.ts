@@ -7,12 +7,17 @@
 
 import type { PushSender } from './sender.js';
 import type { DeviceRecord } from '../storage/interface.js';
+import { isSendablePushUrl } from './url-guard.js';
 
 const WAKE_BODY = 'nuco-wake';
+const REQUEST_TIMEOUT_MS = 10_000;
 
 export class UnifiedPushSender implements PushSender {
   async sendWake(device: DeviceRecord): Promise<boolean> {
     if (device.push.kind !== 'unifiedpush' || !device.push.endpoint) return false;
+    // Refuse endpoints that resolve to private/loopback/link-local addresses, so the relay
+    // cannot be aimed at internal services.
+    if (!(await isSendablePushUrl(device.push.endpoint))) return false;
     try {
       const response = await fetch(device.push.endpoint, {
         method: 'POST',
@@ -23,6 +28,8 @@ export class UnifiedPushSender implements PushSender {
           Urgency: 'high',
         },
         body: WAKE_BODY,
+        // Without a timeout a slow or hanging endpoint would pin a connection indefinitely.
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       return response.ok;
     } catch {

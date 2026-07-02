@@ -32,6 +32,9 @@ export interface Storage {
   registerDevice(rec: DeviceRecord): void;
   getDevice(handle: string): DeviceRecord | undefined;
   updatePush(handle: string, push: PushRegistration): void;
+  // Drop a device's push route (e.g. after APNs reports the token is no longer registered),
+  // so the relay stops sending wakes to a dead token. The account itself is kept.
+  clearPush(handle: string): void;
   touchDevice(handle: string, now: number): void;
 
   // Prekeys.

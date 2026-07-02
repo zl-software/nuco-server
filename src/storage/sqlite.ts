@@ -106,6 +106,12 @@ export class SqliteStorage implements Storage {
       .run(push.kind, push.token ?? null, push.endpoint ?? null, push.apnsTopic ?? null, handle);
   }
 
+  clearPush(handle: string): void {
+    this.db
+      .prepare("UPDATE devices SET push_kind = 'none', push_token = NULL, push_endpoint = NULL, apns_topic = NULL WHERE handle = ?")
+      .run(handle);
+  }
+
   touchDevice(handle: string, now: number): void {
     this.db.prepare('UPDATE devices SET last_seen = ? WHERE handle = ?').run(now, handle);
   }

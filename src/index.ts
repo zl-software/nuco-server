@@ -25,7 +25,7 @@ function main(): void {
   // In dev mode the relay logs the wake instead of sending. In production it sends APNs (if
   // a .p8 is configured) and UnifiedPush directly.
   const mock = config.dev ? new MockPushSender() : null;
-  const apns = config.apns ? new ApnsPushSender(config.apns) : null;
+  const apns = config.apns ? new ApnsPushSender(config.apns, (handle) => storage.clearPush(handle)) : null;
   const unifiedPush = new UnifiedPushSender();
   const fanout = new PushFanout(apns, unifiedPush, mock);
 

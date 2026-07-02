@@ -18,7 +18,12 @@ export class ApnsPushSender implements PushSender {
   private signingKey: Awaited<ReturnType<typeof importPKCS8>> | null = null;
   private token: { value: string; mintedAt: number } | null = null;
 
-  constructor(private readonly config: ApnsConfig) {}
+  // onUnregistered is invoked with the handle when APNs reports the token is gone (410), so
+  // the caller can prune the dead token from storage.
+  constructor(
+    private readonly config: ApnsConfig,
+    private readonly onUnregistered?: (handle: string) => void,
+  ) {}
 
   private async getSigningKey(): Promise<Awaited<ReturnType<typeof importPKCS8>>> {
     if (!this.signingKey) {
@@ -60,7 +65,7 @@ export class ApnsPushSender implements PushSender {
       const req = session.request({
         [constants.HTTP2_HEADER_METHOD]: 'POST',
         [constants.HTTP2_HEADER_PATH]: `/3/device/${device.push.token}`,
-        [constants.HTTP2_HEADER_AUTHORIZATION]: `bearer ${token}`,
+        [constants.HTTP2_HEADER_AUTHORIZATION]: `Bearer ${token}`,
         'apns-topic': topic,
         'apns-push-type': 'background',
         'apns-priority': '5',
@@ -72,8 +77,9 @@ export class ApnsPushSender implements PushSender {
       req.on('error', () => resolve(false));
       req.on('end', () => {
         if (status === 410) {
-          // The device token is no longer valid. The caller may prune it.
+          // The device token is no longer registered with APNs. Prune it so we stop trying.
           console.log(`[push:apns] token gone for ${device.handle} (410)`);
+          this.onUnregistered?.(device.handle);
         }
         resolve(status >= 200 && status < 300);
       });

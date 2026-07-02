@@ -14,6 +14,7 @@ import type { Config } from '../config.js';
 import type { Storage, DeviceRecord, QueuedMessage } from '../storage/interface.js';
 import { Session } from './session.js';
 import { makeChallenge, verifyAuthSignature } from '../auth.js';
+import { isSyntacticallyPublicHttpsUrl } from '../push/url-guard.js';
 
 export interface RelayContext {
   readonly config: Config;
@@ -96,6 +97,12 @@ function dispatch(ctx: RelayContext, session: Session, msg: ClientMessage): void
       // Creating a new handle is allowed before auth; updating an existing one is not.
       if (existing && !session.authenticated) {
         fail(session, ErrorCode.Unauthenticated, msg.rid);
+        return;
+      }
+      // A UnifiedPush endpoint is a URL the relay will POST to; reject obviously hostile ones
+      // (non https, localhost, private literal IPs) at the door. The sender re-checks with DNS.
+      if (msg.push.kind === 'unifiedpush' && (!msg.push.endpoint || !isSyntacticallyPublicHttpsUrl(msg.push.endpoint))) {
+        fail(session, ErrorCode.MalformedMessage, msg.rid);
         return;
       }
       const now = ctx.now();
