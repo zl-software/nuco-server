@@ -253,6 +253,13 @@ async function main(): Promise<void> {
     check(carolState.wakes === 1, 'offline recipient triggered a content free push wake');
     check(carolState.queueDepth === 1, 'message queued for offline carol');
 
+    // A resend of the same envelope id must not re-queue or re-wake (dedup by id).
+    await bob.sendMessage('carol', { id: 'msg-2', ciphertext: Buffer.from('x').toString('base64'), messageType: 'whisper', sentAt: 1 });
+    await new Promise((r) => setTimeout(r, 200));
+    const carolAfter = await debugState(server, 'carol');
+    check(carolAfter.wakes === 1, 'duplicate envelope id does not trigger a second wake');
+    check(carolAfter.queueDepth === 1, 'duplicate envelope id does not re-queue');
+
     // TURN credentials (test mode: canned, exercising the frame path end to end).
     const turnMsg = await alice.turnCredentials();
     check(turnMsg.type === 'turnCredentialsResult', 'alice got turn credentials');

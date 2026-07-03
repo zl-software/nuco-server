@@ -36,6 +36,11 @@ interface SessionState {
   handle: string;
   authenticated: boolean;
   challenge: string | null;
+  // Frames sent before authenticating. Handles are public and any socket can open against
+  // a handle's mailbox, so an unauthenticated flood must not draw down the owner's
+  // authenticated budget; a small per socket allowance covers the handshake and then the
+  // socket is closed.
+  preAuthFrames: number;
 }
 
 // A type literal (not an interface) so it satisfies the sql.exec Record constraint.
@@ -59,17 +64,12 @@ export type DeliverResult =
 const SWEEP_INTERVAL_MS = 3_600_000;
 const STATIC_PING = '{"type":"ping","ts":0}';
 const STATIC_PONG = '{"type":"pong","ts":0}';
+// Enough for the handshake (connect, optional register, authenticate) with slack.
+const PRE_AUTH_FRAME_MAX = 8;
 
 export class MailboxDO extends DurableObject<Env> {
-  // In memory rate bucket. Hibernation resets it, which only ever forgives tokens; the
-  // budget is per handle here (each mailbox serves one handle), not per source IP.
-  private rateTokens: number;
-  private rateLast: number;
-
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.rateTokens = intVar(env.RATE_MAX_PER_MIN, 600);
-    this.rateLast = Date.now();
     this.initSchema();
     // Answered at the edge without waking a hibernated object (byte exact match).
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(STATIC_PING, STATIC_PONG));
@@ -125,7 +125,7 @@ export class MailboxDO extends DurableObject<Env> {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
-    setSession(server, { handle, authenticated: false, challenge: null });
+    setSession(server, { handle, authenticated: false, challenge: null, preAuthFrames: 0 });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -138,9 +138,23 @@ export class MailboxDO extends DurableObject<Env> {
       this.fail(ws, ErrorCode.MessageTooLarge);
       return;
     }
-    if (!this.rateAllow()) {
-      this.fail(ws, ErrorCode.RateLimited);
-      return;
+    const session = getSession(ws);
+    if (session.authenticated) {
+      // The per handle token bucket applies only to the authenticated owner (nobody else
+      // can authenticate as this handle), and it is persisted so hibernation cannot refill
+      // it early.
+      if (!this.rateAllow()) {
+        this.fail(ws, ErrorCode.RateLimited);
+        return;
+      }
+    } else {
+      if (session.preAuthFrames >= PRE_AUTH_FRAME_MAX) {
+        this.fail(ws, ErrorCode.RateLimited);
+        ws.close(1008, 'unauthenticated flood');
+        return;
+      }
+      session.preAuthFrames += 1;
+      setSession(ws, session);
     }
     const parsed = parseClientMessage(raw);
     if (!parsed.ok) {
@@ -339,24 +353,33 @@ export class MailboxDO extends DurableObject<Env> {
     const existing = this.ctx.storage.sql
       .exec<{ seq: number }>('SELECT seq FROM inbox WHERE id = ?', envelope.id)
       .toArray()[0];
-    let seq: number;
     if (existing) {
-      // Duplicate send (client retry): keep the original row, re deliver below.
-      seq = existing.seq;
-    } else {
-      if (this.queueDepth() >= intVar(this.env.QUEUE_MAX, 1000)) return { ok: false, reason: 'queue-full' };
-      this.ctx.storage.sql.exec(
-        'INSERT INTO inbox (id, sender, ciphertext, message_type, sent_at, enqueued_at) VALUES (?, ?, ?, ?, ?, ?)',
-        envelope.id,
-        from,
-        envelope.ciphertext,
-        envelope.messageType,
-        envelope.sentAt,
-        Date.now(),
-      );
-      seq = this.ctx.storage.sql.exec<{ seq: number }>('SELECT seq FROM inbox WHERE id = ?', envelope.id).one().seq;
-      await this.ensureSweepAlarm();
+      // Duplicate send (client retry): the message is already queued. Re deliver to a live
+      // socket if the recipient is now connected (deduped by id on the client), but never
+      // trigger another push wake and never re-check the cap; that would let a repeated id
+      // spam wakes while the queue depth stays at one.
+      let delivered = false;
+      for (const ws of this.ctx.getWebSockets()) {
+        if (getSession(ws).authenticated) {
+          this.send(ws, { type: 'deliver', from, envelope, seq: existing.seq });
+          delivered = true;
+        }
+      }
+      return { ok: true, seq: existing.seq, delivered };
     }
+
+    if (this.queueDepth() >= intVar(this.env.QUEUE_MAX, 1000)) return { ok: false, reason: 'queue-full' };
+    this.ctx.storage.sql.exec(
+      'INSERT INTO inbox (id, sender, ciphertext, message_type, sent_at, enqueued_at) VALUES (?, ?, ?, ?, ?, ?)',
+      envelope.id,
+      from,
+      envelope.ciphertext,
+      envelope.messageType,
+      envelope.sentAt,
+      Date.now(),
+    );
+    const seq = this.ctx.storage.sql.exec<{ seq: number }>('SELECT seq FROM inbox WHERE id = ?', envelope.id).one().seq;
+    await this.ensureSweepAlarm();
 
     let delivered = false;
     for (const ws of this.ctx.getWebSockets()) {
@@ -515,13 +538,21 @@ export class MailboxDO extends DurableObject<Env> {
     return true;
   }
 
+  // Token bucket persisted in storage so it survives hibernation (an in memory bucket would
+  // reset to full on every wake, defeating the limit). Synchronous kv on the SQLite object.
   private rateAllow(): boolean {
     const maxPerMinute = intVar(this.env.RATE_MAX_PER_MIN, 600);
     const now = Date.now();
-    this.rateTokens = Math.min(maxPerMinute, this.rateTokens + ((now - this.rateLast) * maxPerMinute) / 60_000);
-    this.rateLast = now;
-    if (this.rateTokens < 1) return false;
-    this.rateTokens -= 1;
+    const tokens = (this.ctx.storage.kv.get('rateTokens') as number | undefined) ?? maxPerMinute;
+    const last = (this.ctx.storage.kv.get('rateLast') as number | undefined) ?? now;
+    let refilled = Math.min(maxPerMinute, tokens + ((now - last) * maxPerMinute) / 60_000);
+    this.ctx.storage.kv.put('rateLast', now);
+    if (refilled < 1) {
+      this.ctx.storage.kv.put('rateTokens', refilled);
+      return false;
+    }
+    refilled -= 1;
+    this.ctx.storage.kv.put('rateTokens', refilled);
     return true;
   }
 
@@ -539,7 +570,7 @@ export class MailboxDO extends DurableObject<Env> {
 }
 
 function getSession(ws: WebSocket): SessionState {
-  return (ws.deserializeAttachment() as SessionState | null) ?? { handle: '', authenticated: false, challenge: null };
+  return (ws.deserializeAttachment() as SessionState | null) ?? { handle: '', authenticated: false, challenge: null, preAuthFrames: 0 };
 }
 
 function setSession(ws: WebSocket, session: SessionState): void {
