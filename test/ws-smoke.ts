@@ -1,11 +1,11 @@
 // Server level smoke test: drives the relay over real WebSockets with an Ed25519 auth
 // key and placeholder ciphertext, exercising connect, register, authenticate, prekey
-// publish and fetch, live delivery, ack, and the offline push wake. Real Signal crypto is
-// exercised by the two client end to end harness (test/e2e.ts) once the app crypto exists.
+// publish and fetch, live delivery, ack, TURN credential issuance, and the offline push
+// wake. Real Signal crypto is exercised by the two client end to end harness (test/e2e.ts).
 //
 // Run: npx tsx test/ws-smoke.ts
 
-import { generateKeyPairSync, sign, randomBytes, type KeyObject } from 'node:crypto';
+import { generateKeyPairSync, sign, createHmac, type KeyObject } from 'node:crypto';
 import { WebSocket } from 'ws';
 
 import {
@@ -21,6 +21,7 @@ import { MockPushSender } from '../src/push/mock.js';
 import { RelayServer } from '../src/ws/server.js';
 import { createServer } from '../src/http/server.js';
 import { loadConfig } from '../src/config.js';
+import { computeTurnPassword } from '../src/turn.js';
 
 let failures = 0;
 function check(cond: boolean, label: string): void {
@@ -148,6 +149,9 @@ class Client {
   sendMessage(to: string, envelope: MessageEnvelope): Promise<ServerMessage> {
     return this.request((rid) => ({ type: 'send', rid, to, envelope }));
   }
+  turnCredentials(): Promise<ServerMessage> {
+    return this.request((rid) => ({ type: 'turnCredentials', rid }));
+  }
   ack(id: string): void {
     this.send({ type: 'ack', id });
   }
@@ -174,7 +178,11 @@ function dummyUpload(seed: number): PreKeyUpload {
 
 async function main(): Promise<void> {
   process.env.RELAY_DEV = '1';
-  const config = { ...loadConfig(), port: 0 };
+  const config = {
+    ...loadConfig(),
+    port: 0,
+    turn: { secret: 'nuco-test-secret', urls: ['turn:turn.test:3478?transport=udp'], ttlSeconds: 600 },
+  };
   const storage = new SqliteStorage(':memory:');
   const mock = new MockPushSender();
   const relay = new RelayServer(config, storage, new PushFanout(null, null, mock));
@@ -234,6 +242,48 @@ async function main(): Promise<void> {
   await new Promise((r) => setTimeout(r, 50));
   check(mock.sent.length === beforeWakes + 1, 'offline recipient triggered a content free push wake');
   check(storage.queueDepth('carol') === 1, 'message queued for offline carol');
+
+  // TURN credentials: authenticated issuance with a verifiable HMAC.
+  const turnMsg = await alice.turnCredentials();
+  check(turnMsg.type === 'turnCredentialsResult', 'alice got turn credentials');
+  if (turnMsg.type === 'turnCredentialsResult') {
+    check(turnMsg.urls.length === 1 && turnMsg.urls[0] === 'turn:turn.test:3478?transport=udp', 'turn urls echo the config');
+    check(/^\d+:[0-9a-f]{12}$/.test(turnMsg.username), 'turn username is expiry:randomid');
+    check(turnMsg.expiresAt === Number(turnMsg.username.split(':')[0]), 'expiresAt matches the username expiry');
+    const nowSec = Math.floor(Date.now() / 1000);
+    check(turnMsg.expiresAt >= nowSec + 590 && turnMsg.expiresAt <= nowSec + 610, 'expiry honors the configured ttl');
+    const expected = createHmac('sha1', 'nuco-test-secret').update(turnMsg.username).digest('base64');
+    check(turnMsg.credential === expected, 'credential is HMAC-SHA1 over the username');
+  }
+  // Known answer vector: pins the algorithm (a matched change on both sides of the HMAC
+  // recomputation above would otherwise slip through).
+  check(
+    computeTurnPassword('nuco-test-secret', '1700000000:testuser') === 'tmkZjBUsrItOKoRgRYlQXDLFGhQ=',
+    'turn password matches the known answer vector',
+  );
+
+  // TURN credentials require an authenticated socket.
+  const dave = await Client.connect(port, 'dave', makeAuthKeys());
+  const unauthTurn = await dave.turnCredentials();
+  check(unauthTurn.type === 'error' && unauthTurn.code === 'UNAUTHENTICATED', 'turn credentials require auth');
+  dave.close();
+
+  // A relay without TURN configured answers CALLS_UNAVAILABLE.
+  const bareConfig = { ...loadConfig(), port: 0, turn: null };
+  const bareStorage = new SqliteStorage(':memory:');
+  const bareRelay = new RelayServer(bareConfig, bareStorage, new PushFanout(null, null, new MockPushSender()));
+  const bareServer = createServer(bareConfig);
+  bareRelay.attach(bareServer);
+  await new Promise<void>((resolve) => bareServer.listen(0, '127.0.0.1', resolve));
+  const barePort = (bareServer.address() as { port: number }).port;
+  const erin = await Client.connect(barePort, 'erin', makeAuthKeys());
+  await erin.handshake(Buffer.from('erin-identity').toString('base64'));
+  const unavailable = await erin.turnCredentials();
+  check(unavailable.type === 'error' && unavailable.code === 'CALLS_UNAVAILABLE', 'relay without turn answers CALLS_UNAVAILABLE');
+  erin.close();
+  bareRelay.close();
+  bareServer.close();
+  bareStorage.close();
 
   // Version mismatch is rejected.
   const stranger = new WebSocket(`ws://localhost:${port}`);

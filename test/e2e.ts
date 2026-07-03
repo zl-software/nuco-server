@@ -2,13 +2,23 @@
 // code run the full flow against a running relay, proving the contract without two phones.
 //   register -> publish prekeys -> fetch bundle -> X3DH session -> safety number match ->
 //   send a sealed (real Signal) message -> recipient receives, decrypts, asserts plaintext.
-// Also asserts the relay only ever holds ciphertext, and that an offline recipient triggers
-// a content free push wake.
+// Also asserts the relay only ever holds ciphertext, that an offline recipient triggers a
+// content free push wake, and that voice call signaling (offer, answer, end) round trips
+// over the same sealed channel. Real WebRTC cannot run in Node, so call checks use a fake
+// SDP of realistic size and validate signaling, freshness, and glare rules only.
 //
 // Run: npx tsx test/e2e.ts
 
 import { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
+
+import {
+  encodeContent,
+  decodeContent,
+  callOfferWins,
+  CALL_OFFER_STALE_SECONDS,
+  type DecodedContent,
+} from '@nuco/protocol';
 
 import { SqliteStorage } from '../src/storage/sqlite.js';
 import { PushFanout } from '../src/push/sender.js';
@@ -40,11 +50,18 @@ function check(cond: boolean, label: string): void {
   }
 }
 
+interface ReceivedContent {
+  from: string;
+  content: DecodedContent;
+  sentAt: number;
+  receivedAt: number;
+}
+
 interface HeadlessClient {
   handle: string;
   signal: NucoSignal;
   client: RelayClient;
-  received: Array<{ from: string; text: string }>;
+  received: ReceivedContent[];
   identityKeyB64: string;
 }
 
@@ -54,7 +71,7 @@ async function makeClient(port: number, handle: string): Promise<HeadlessClient>
   const pre = await generatePreKeys(id.identityKeyPair, 1, 1, 10);
   await installIdentity(store, id, pre);
   const signal = new NucoSignal(store);
-  const received: Array<{ from: string; text: string }> = [];
+  const received: ReceivedContent[] = [];
 
   const client = new RelayClient({
     url: `ws://127.0.0.1:${port}`,
@@ -71,7 +88,7 @@ async function makeClient(port: number, handle: string): Promise<HeadlessClient>
     autoReconnect: false,
     onDeliver: async (from, envelope) => {
       const plaintext = await signal.decrypt(from, { ciphertext: envelope.ciphertext, messageType: envelope.messageType });
-      received.push({ from, text: utf8Decode(plaintext) });
+      received.push({ from, content: decodeContent(plaintext), sentAt: envelope.sentAt, receivedAt: Date.now() });
       client.ack(envelope.id);
     },
   });
@@ -133,8 +150,12 @@ async function main(): Promise<void> {
     sentAt: Date.now(),
   });
   await waitFor(() => alice.received.length >= 1);
-  check(alice.received[0]?.text === plaintext, 'Alice received and decrypted the sealed message');
-  check(alice.received[0]?.from === 'bob', 'message attributed to Bob');
+  const firstMsg = alice.received[0];
+  check(
+    firstMsg !== undefined && firstMsg.content.t === 'text' && firstMsg.content.body === plaintext,
+    'Alice received and decrypted the sealed message',
+  );
+  check(firstMsg?.from === 'bob', 'message attributed to Bob');
 
   // The relay only ever holds ciphertext: the wire body does not contain the plaintext.
   const sealedBytes = utf8Decode(Uint8Array.from(Buffer.from(sealed.ciphertext, 'base64')));
@@ -150,7 +171,81 @@ async function main(): Promise<void> {
     sentAt: Date.now(),
   });
   await waitFor(() => bob.received.length >= 1);
-  check(bob.received[0]?.text === reply, 'Bob received and decrypted the reply');
+  const replyMsg = bob.received[0];
+  check(
+    replyMsg !== undefined && replyMsg.content.t === 'text' && replyMsg.content.body === reply,
+    'Bob received and decrypted the reply',
+  );
+
+  // Voice call signaling rides the same sealed channel as typed content. The relay cannot
+  // tell it apart from ordinary messages.
+  const callId = randomUUID();
+  const fakeSdp = 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n' + 'a=candidate:relay '.repeat(60);
+  const sealedOffer = await bob.signal.encrypt('alice', encodeContent({ t: 'call/offer', callId, sdp: fakeSdp }));
+  await bob.client.sendEnvelope('alice', {
+    id: randomUUID(),
+    ciphertext: sealedOffer.ciphertext,
+    messageType: sealedOffer.messageType,
+    sentAt: Date.now(),
+  });
+  await waitFor(() => alice.received.length >= 2);
+  const offer = alice.received[1];
+  check(
+    offer !== undefined && offer.content.t === 'call/offer' && offer.content.callId === callId && offer.content.sdp === fakeSdp,
+    'Alice received the sealed call offer intact',
+  );
+  check(
+    offer !== undefined && offer.receivedAt - offer.sentAt < CALL_OFFER_STALE_SECONDS * 1000,
+    'a live offer is fresh under the staleness rule',
+  );
+  const offerWire = utf8Decode(Uint8Array.from(Buffer.from(sealedOffer.ciphertext, 'base64')));
+  check(!offerWire.includes('call/offer'), 'call signaling is opaque on the wire');
+
+  const sealedAnswer = await alice.signal.encrypt('bob', encodeContent({ t: 'call/answer', callId, sdp: fakeSdp }));
+  await alice.client.sendEnvelope('bob', {
+    id: randomUUID(),
+    ciphertext: sealedAnswer.ciphertext,
+    messageType: sealedAnswer.messageType,
+    sentAt: Date.now(),
+  });
+  await waitFor(() => bob.received.length >= 2);
+  const answer = bob.received[1];
+  check(
+    answer !== undefined && answer.content.t === 'call/answer' && answer.content.callId === callId,
+    'Bob received the call answer for the same call',
+  );
+
+  const sealedEnd = await bob.signal.encrypt('alice', encodeContent({ t: 'call/end', callId, reason: 'hangup' }));
+  await bob.client.sendEnvelope('alice', {
+    id: randomUUID(),
+    ciphertext: sealedEnd.ciphertext,
+    messageType: sealedEnd.messageType,
+    sentAt: Date.now(),
+  });
+  await waitFor(() => alice.received.length >= 3);
+  const end = alice.received[2];
+  check(
+    end !== undefined && end.content.t === 'call/end' && end.content.reason === 'hangup',
+    'Alice received the call end',
+  );
+
+  // A queued offer redelivered late classifies as stale (missed call, never a ring).
+  const sealedStale = await bob.signal.encrypt('alice', encodeContent({ t: 'call/offer', callId: randomUUID(), sdp: fakeSdp }));
+  await bob.client.sendEnvelope('alice', {
+    id: randomUUID(),
+    ciphertext: sealedStale.ciphertext,
+    messageType: sealedStale.messageType,
+    sentAt: Date.now() - (CALL_OFFER_STALE_SECONDS * 1000 + 5000),
+  });
+  await waitFor(() => alice.received.length >= 4);
+  const stale = alice.received[3];
+  check(
+    stale !== undefined && stale.receivedAt - stale.sentAt >= CALL_OFFER_STALE_SECONDS * 1000,
+    'a late redelivered offer classifies as stale',
+  );
+
+  // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
+  check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
 
   // Offline recipient: Carol registers, disconnects, then a send to her triggers a wake.
   const carol = await makeClient(port, 'carol');
