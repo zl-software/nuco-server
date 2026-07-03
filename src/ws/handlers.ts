@@ -15,6 +15,7 @@ import type { Storage, DeviceRecord, QueuedMessage } from '../storage/interface.
 import { Session } from './session.js';
 import { makeChallenge, verifyAuthSignature } from '../auth.js';
 import { isSyntacticallyPublicHttpsUrl } from '../push/url-guard.js';
+import { issueTurnCredentials } from '../turn.js';
 
 export interface RelayContext {
   readonly config: Config;
@@ -231,6 +232,26 @@ function dispatch(ctx: RelayContext, session: Session, msg: ClientMessage): void
       session.authenticated = false;
       if (ctx.config.dev) console.log(`[relay] deregistered ${session.handle}`);
       session.send({ type: 'ok', rid: msg.rid });
+      return;
+    }
+
+    case 'turnCredentials': {
+      if (!requireAuth(session, msg.rid)) return;
+      if (!ctx.config.turn) {
+        fail(session, ErrorCode.CallsUnavailable, msg.rid);
+        return;
+      }
+      // Never log any part of the result (even in dev): a credential grants relay
+      // bandwidth until it expires.
+      const creds = issueTurnCredentials(ctx.config.turn, ctx.now());
+      session.send({
+        type: 'turnCredentialsResult',
+        rid: msg.rid,
+        urls: creds.urls,
+        username: creds.username,
+        credential: creds.credential,
+        expiresAt: creds.expiresAt,
+      });
       return;
     }
   }

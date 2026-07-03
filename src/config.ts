@@ -49,6 +49,12 @@ export interface ApnsConfig {
   host: string;
 }
 
+export interface TurnConfig {
+  secret: string;
+  urls: string[];
+  ttlSeconds: number;
+}
+
 export interface Config {
   dev: boolean;
   host: string;
@@ -60,6 +66,7 @@ export interface Config {
   rateMaxPerMin: number;
   maxMessageBytes: number;
   apns: ApnsConfig | null;
+  turn: TurnConfig | null;
 }
 
 export function loadConfig(): Config {
@@ -97,6 +104,29 @@ export function loadConfig(): Config {
     };
   }
 
+  // TURN credential issuance for voice calls (src/turn.ts). Fail fast on a partial config:
+  // a secret without urls advertises nothing a client can use, and urls without a secret
+  // would issue credentials the TURN server rejects. Deliberately not gated on dev: a dev
+  // relay pointed at a LAN coturn is the supported local call testing path, and a relay
+  // without TURN vars simply answers CALLS_UNAVAILABLE. The TTL caps how long an
+  // established call can refresh its TURN allocation, so it bounds call length too.
+  const turnSecret = optStr('RELAY_TURN_SECRET');
+  const turnUrlList = optStr('RELAY_TURN_URLS');
+  let turn: TurnConfig | null = null;
+  if (turnSecret || turnUrlList) {
+    if (!turnSecret || !turnUrlList) {
+      throw new Error('RELAY_TURN_SECRET and RELAY_TURN_URLS must be set together');
+    }
+    const urls = turnUrlList
+      .split(',')
+      .map((u) => u.trim())
+      .filter((u) => u.length > 0);
+    if (urls.length === 0 || !urls.every((u) => u.startsWith('turn:') || u.startsWith('turns:'))) {
+      throw new Error('RELAY_TURN_URLS must be a comma separated list of turn: or turns: URLs');
+    }
+    turn = { secret: turnSecret, urls, ttlSeconds: int('RELAY_TURN_TTL_SECONDS', 7200) };
+  }
+
   return {
     dev,
     host: str('RELAY_HOST', '0.0.0.0'),
@@ -108,5 +138,6 @@ export function loadConfig(): Config {
     rateMaxPerMin: int('RELAY_RATE_MAX_PER_MIN', 600),
     maxMessageBytes: int('RELAY_MAX_MESSAGE_BYTES', 131072),
     apns,
+    turn,
   };
 }
