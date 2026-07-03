@@ -6,6 +6,7 @@ dist/
 .env
 .env.*
 !.env.example
+coturn/turnserver.conf
 *.p8
 *.pem
 *.key

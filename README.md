@@ -15,6 +15,11 @@ timing, and a padded message size bucket. Operators and users should treat that 
 visible to whoever runs the relay. The app states this plainly on its About and Privacy
 screen.
 
+Voice calls extend this by exactly one dimension: call signaling is sealed content the
+relay cannot read, but the TURN server (run by the same operator) sees both endpoints' IP
+addresses, allocation times, duration, and byte counts. The media payload it forwards is
+DTLS-SRTP ciphertext it cannot decrypt. See PROTOCOL.md "Voice calls".
+
 ## Requirements
 
 - Node 24 LTS (Node 22 also works). The Docker image pins Node 24.
@@ -56,6 +61,51 @@ If you prefer to terminate TLS in the relay process instead of using a reverse p
 `RELAY_TLS_CERT` and `RELAY_TLS_KEY` to your certificate and key paths and expose the port
 directly.
 
+## Voice calls (TURN)
+
+Calls need a TURN server: the app forces relay only media so peers never learn each
+other's IP address. The stack ships coturn as an opt in compose profile, and the relay
+issues short lived credentials for it (TURN REST scheme, nothing stored server side). If
+TURN is not configured the relay answers CALLS_UNAVAILABLE, the app disables calling, and
+messaging is unaffected.
+
+1. Create a DNS A record for a turn subdomain (for example `turn.your-domain`) pointing at
+   the same host.
+2. Generate a shared secret: `openssl rand -hex 32`.
+3. Copy `coturn/turnserver.conf.example` to `coturn/turnserver.conf` (gitignored), set
+   `static-auth-secret` to the secret and `realm` to your turn subdomain. On a cloud VM
+   behind 1:1 NAT, also set `external-ip`.
+4. In `.env`, set `TURN_SECRET` and `RELAY_TURN_SECRET` to the same secret, and
+   `RELAY_TURN_URLS` to
+   `turn:turn.your-domain:3478?transport=udp,turn:turn.your-domain:3478?transport=tcp`.
+   Uncomment the RELAY_TURN lines in `docker-compose.yml`.
+5. Open the firewall: 3478 udp and tcp, plus the relay media range 49160 to 49360 udp.
+6. Start everything: `docker compose --profile calls up -d`.
+
+Notes:
+
+- `RELAY_TURN_TTL_SECONDS` (default 7200) is the credential lifetime. coturn stops
+  refreshing an allocation once the embedded expiry passes, so the TTL also caps how long
+  a single call can last. Credentials are fetched per call.
+- Media stays end to end encrypted (DTLS-SRTP) regardless of the TURN transport, so plain
+  `turn:` on 3478 is the default. `turns:` (TLS) only helps traverse restrictive networks;
+  if you enable it, remember coturn does not reload renewed certificates, restart it after
+  each renewal.
+- The example config denies relaying into private, loopback, and link local ranges so the
+  TURN server cannot be used as a pivot into your network, and bounds bandwidth with
+  quotas (`total-quota`, `user-quota`, `max-bps`).
+
+For local call testing against a dev relay, run a throwaway coturn on your LAN:
+
+```
+docker run --rm --network host coturn/coturn:4 --use-auth-secret \
+  --static-auth-secret=devsecret --realm=nuco.dev --no-tls --no-dtls --fingerprint --no-cli
+```
+
+and start the relay with `RELAY_TURN_SECRET=devsecret` and
+`RELAY_TURN_URLS=turn:<LAN_IP>:3478?transport=udp`. A dev relay without these vars simply
+reports calls unavailable.
+
 ## iOS push (APNs)
 
 iOS background wakes require a paid Apple Developer account and an APNs Auth Key (.p8). The
@@ -85,6 +135,7 @@ All settings are environment variables; see `.env.example`. Key ones:
 - `RELAY_TLS_CERT`, `RELAY_TLS_KEY` (in process TLS, optional)
 - `RELAY_SQLITE_PATH`, `RELAY_QUEUE_MAX`, `RELAY_QUEUE_TTL_SECONDS`
 - `RELAY_RATE_MAX_PER_MIN`, `RELAY_MAX_MESSAGE_BYTES`
+- `RELAY_TURN_SECRET`, `RELAY_TURN_URLS`, `RELAY_TURN_TTL_SECONDS` (optional voice calls)
 - `APNS_*` (optional iOS push)
 
 ## Storage
@@ -96,7 +147,13 @@ touching the relay logic. All key and ciphertext columns are opaque to the relay
 ## Security notes
 
 - The relay logs operational events only, never ciphertext or full who to whom maps beyond
-  what an operation needs.
+  what an operation needs. TURN credentials, usernames, and the shared secret are never
+  logged; the issued usernames are random ids rather than handles so coturn's own logs do
+  not accumulate a handle to call time map.
 - Rate limiting is in process (token bucket per connection). Behind multiple instances, move
-  limits and queues to a shared store.
-- Keep the `.p8` and any TLS keys out of git and mount them as secrets.
+  limits and queues to a shared store. TURN credential requests share the same per ip
+  bucket; that is deliberate. A full call setup costs about five frames, and hoarding
+  credentials grants nothing (they are derived, not stored, and each expires on its own).
+  Actual relay bandwidth abuse is bounded where it happens, by coturn's quotas.
+- Keep the `.p8`, `coturn/turnserver.conf`, and any TLS keys out of git and mount them as
+  secrets.
