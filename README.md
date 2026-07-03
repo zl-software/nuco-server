@@ -1,9 +1,10 @@
 # nuco-server
 
-The Nuco relay: an untrusted store and forward server. It transports sealed ciphertext,
-hosts public prekey bundles, and sends content free push wakes. It can never read messages
-and holds no private keys. Minimal, auditable dependencies: `ws`, `jose`, and
-`better-sqlite3`, plus Node built ins for HTTP and HTTP/2.
+The Nuco relay: an untrusted store and forward server for sealed ciphertext, public prekey
+bundles, content free push wakes, and TURN credentials for voice calls. It runs on
+Cloudflare Workers: one Durable Object per handle holds that handle's device record,
+prekeys, message queue, and live WebSocket (hibernated while idle). It can never read
+messages and holds no private keys.
 
 See `../protocol/PROTOCOL.md` for the wire contract this server implements.
 
@@ -11,149 +12,124 @@ See `../protocol/PROTOCOL.md` for the wire contract this server implements.
 
 The relay only ever sees ciphertext plus routing metadata. It cannot see message content,
 display names in messages, or any private key. It can see which handles are in contact,
-timing, and a padded message size bucket. Operators and users should treat that metadata as
-visible to whoever runs the relay. The app states this plainly on its About and Privacy
-screen.
+timing, and a padded message size bucket. Because the relay runs on Cloudflare Workers,
+that metadata (plus client IPs and, for calls, TURN allocation timing and volume) is
+visible to Cloudflare as the infrastructure operator; sealed content and DTLS-SRTP call
+media remain unreadable. Self hosting means deploying this Worker on your own Cloudflare
+account. The app states all of this plainly on its About and Privacy screen.
 
-Voice calls extend this by exactly one dimension: call signaling is sealed content the
-relay cannot read, but the TURN server (run by the same operator) sees both endpoints' IP
-addresses, allocation times, duration, and byte counts. The media payload it forwards is
-DTLS-SRTP ciphertext it cannot decrypt. See PROTOCOL.md "Voice calls".
+## Architecture
+
+- `src/worker.ts`: entry. `/health`, WebSocket routing (the client carries its handle in
+  the URL query since protocol 1.4), dev only `/debug/state`.
+- `src/mailbox.ts`: `MailboxDO`, one Durable Object per handle. Co-located SQLite holds
+  the device record, prekeys, and inbox; the socket is a hibernatable WebSocket (the
+  static heartbeat ping is answered at the edge without waking the object). Cross handle
+  operations (`send`, `fetchPreKeyBundle`) are DO to DO RPC. A per object alarm sweeps
+  expired queued messages.
+- `src/auth.ts`: Ed25519 challenge verification via WebCrypto.
+- `src/push/`: APNs (ES256 JWT via jose, sent with fetch) and UnifiedPush (plain POST,
+  SSRF guarded). Payloads are content free.
+- `src/turn.ts`: voice call TURN credentials minted by Cloudflare Realtime TURN.
 
 ## Requirements
 
-- Node 24 LTS (Node 22 also works). The Docker image pins Node 24.
-- The shared `@nuco/protocol` package, which lives in a sibling `protocol` folder and is
-  referenced through `file:../protocol`. Clone both repos side by side.
+- Node 24 LTS and npm (for tooling; the relay itself runs on Workers).
+- A Cloudflare account on the Workers paid plan (Durable Objects).
+- The shared `@nuco/protocol` package in a sibling `protocol` folder (`file:../protocol`).
+  Clone both repos side by side and build it once:
+  `npm --prefix ../protocol install && npm --prefix ../protocol run build`.
 
 ## Development
 
 ```
-# build the shared protocol once
-npm --prefix ../protocol install
-npm --prefix ../protocol run build
-
 npm install
-npm run dev        # RELAY_DEV=1: no TLS, in memory SQLite, push mocked (logged)
+npm run dev        # wrangler dev with DEV=1: local workerd, push mocked, debug endpoints
 ```
 
-Dev mode listens on `ws://localhost:8787`. Run the tests:
+Dev mode listens on `ws://localhost:8787`. Point the app at it with
+`EXPO_PUBLIC_RELAY_URL=ws://<LAN_IP>:8787`. Run the tests (each boots its own wrangler dev
+with fresh state):
 
 ```
+npm run typecheck
 npm test           # server level WebSocket smoke test
-npm run test:e2e   # two headless clients exchange a real sealed message end to end
+npm run test:e2e   # two headless clients exchange real sealed messages and call signaling
 ```
 
-## Production with Docker and Caddy
+## Deployment
 
-The provided `docker-compose.yml` runs the relay behind Caddy, which terminates TLS with an
-automatic Let's Encrypt certificate and upgrades the WebSocket. Edit `Caddyfile` to use your
-domain, then:
+The custom domain `nuco-server.zlsoftware.at` is configured in `wrangler.jsonc`; the
+`zlsoftware.at` zone must be on the deploying Cloudflare account (Cloudflare provisions
+the DNS record and certificate on deploy).
 
 ```
-docker compose up -d
+npx wrangler login
+npx wrangler deploy
+curl https://nuco-server.zlsoftware.at/health
 ```
 
-Point the app's Server setting (custom) at `wss://your-domain`. The relay stores its SQLite
-database on a named volume, so it survives restarts.
-
-If you prefer to terminate TLS in the relay process instead of using a reverse proxy, set
-`RELAY_TLS_CERT` and `RELAY_TLS_KEY` to your certificate and key paths and expose the port
-directly.
+The app's default server is `wss://nuco-server.zlsoftware.at`; a custom server can still
+be set in the app's Settings.
 
 ## Voice calls (TURN)
 
-Calls need a TURN server: the app forces relay only media so peers never learn each
-other's IP address. The stack ships coturn as an opt in compose profile, and the relay
-issues short lived credentials for it (TURN REST scheme, nothing stored server side). If
-TURN is not configured the relay answers CALLS_UNAVAILABLE, the app disables calling, and
-messaging is unaffected.
+Calls need TURN: the app forces relay only media so peers never learn each other's IP.
+The relay mints short lived credentials from Cloudflare Realtime TURN; without a key it
+answers CALLS_UNAVAILABLE, the app disables calling, and messaging is unaffected.
 
-1. Create a DNS A record for a turn subdomain (for example `turn.your-domain`) pointing at
-   the same host.
-2. Generate a shared secret: `openssl rand -hex 32`.
-3. Copy `coturn/turnserver.conf.example` to `coturn/turnserver.conf` (gitignored), set
-   `static-auth-secret` to the secret and `realm` to your turn subdomain. On a cloud VM
-   behind 1:1 NAT, also set `external-ip`.
-4. In `.env`, set `TURN_SECRET` and `RELAY_TURN_SECRET` to the same secret, and
-   `RELAY_TURN_URLS` to
-   `turn:turn.your-domain:3478?transport=udp,turn:turn.your-domain:3478?transport=tcp`.
-   Uncomment the RELAY_TURN lines in `docker-compose.yml`.
-5. Open the firewall: 3478 udp and tcp, plus the relay media range 49160 to 49360 udp.
-6. Start everything: `docker compose --profile calls up -d`.
+1. Create a TURN key: dashboard (Realtime, TURN) or
+   `POST /accounts/{account_id}/calls/turn_keys`. Save the key id and the secret.
+2. `npx wrangler secret put TURN_KEY_ID` and `npx wrangler secret put TURN_KEY_SECRET`.
+3. Optional: adjust `TURN_TTL_SECONDS` in `wrangler.jsonc` (default 7200; the TTL caps how
+   long an established call can refresh its allocation, so it also bounds call length; the
+   Cloudflare maximum is 48 hours).
 
-Notes:
-
-- `RELAY_TURN_TTL_SECONDS` (default 7200) is the credential lifetime. coturn stops
-  refreshing an allocation once the embedded expiry passes, so the TTL also caps how long
-  a single call can last. Credentials are fetched per call.
-- Media stays end to end encrypted (DTLS-SRTP) regardless of the TURN transport, so plain
-  `turn:` on 3478 is the default. `turns:` (TLS) only helps traverse restrictive networks;
-  if you enable it, remember coturn does not reload renewed certificates, restart it after
-  each renewal.
-- The example config denies relaying into private, loopback, and link local ranges so the
-  TURN server cannot be used as a pivot into your network, and bounds bandwidth with
-  quotas (`total-quota`, `user-quota`, `max-bps`).
-
-For local call testing against a dev relay, run a throwaway coturn on your LAN:
-
-```
-docker run --rm --network host coturn/coturn:4 --use-auth-secret \
-  --static-auth-secret=devsecret --realm=nuco.dev --no-tls --no-dtls --fingerprint --no-cli
-```
-
-and start the relay with `RELAY_TURN_SECRET=devsecret` and
-`RELAY_TURN_URLS=turn:<LAN_IP>:3478?transport=udp`. A dev relay without these vars simply
-reports calls unavailable.
+TURN usage is billed by Cloudflare per outbound GB; an hour of Opus voice is roughly
+100 MB. Media through TURN stays end to end encrypted (DTLS-SRTP).
 
 ## iOS push (APNs)
 
-iOS background wakes require a paid Apple Developer account and an APNs Auth Key (.p8). The
-relay sends the wake directly to Apple over HTTP/2 with an ES256 JWT; no Firebase is
-involved, and the payload carries no content. To enable it:
+The relay sends the wake directly to Apple with an ES256 provider token; the payload
+carries no content. To enable it:
 
 1. Create an APNs Auth Key in the Apple Developer portal and download the `.p8`.
-2. Mount the `.p8` into the container (see the commented volume in `docker-compose.yml`) and
-   set `APNS_KEY_PATH`, `APNS_KEY_ID`, `APNS_TEAM_ID`, and `APNS_BUNDLE_ID`.
-3. Use `APNS_HOST=api.push.apple.com` for production or `api.sandbox.push.apple.com` for
-   development builds.
+2. `npx wrangler secret put APNS_KEY` (paste the full PEM content of the `.p8`), then
+   `APNS_KEY_ID`, `APNS_TEAM_ID`, and `APNS_BUNDLE_ID` the same way.
+3. `APNS_HOST` in `wrangler.jsonc` selects production or sandbox
+   (`api.sandbox.push.apple.com` for development builds).
 
-If no `.p8` is configured the relay runs fine without iOS push; iOS clients still receive
+Transport caveat: Apple's provider API requires HTTP/2. Deployed Workers negotiate HTTP/2
+to Apple at the edge (the established pattern for APNs from Workers), but Cloudflare does
+not contractually guarantee the outbound protocol, and local `wrangler dev` cannot speak
+HTTP/2 outbound at all, so dev mode mocks push sending. Verify APNs against a deployed
+Worker; if the behavior ever changes, fall back to a small external push proxy.
+
+If no key is configured the relay runs fine without iOS push; clients still receive
 messages whenever they are connected.
 
 ## Android push (UnifiedPush)
 
-No server configuration is needed. The app registers an endpoint URL with its chosen
-UnifiedPush distributor (for example ntfy) and sends that URL to the relay. The relay POSTs
-a tiny content free body to that endpoint to wake the device.
+No server configuration. The app registers an endpoint URL with its distributor and the
+relay POSTs a tiny content free body to it. Endpoints are SSRF checked at registration and
+again before every send.
 
 ## Configuration
 
-All settings are environment variables; see `.env.example`. Key ones:
-
-- `RELAY_DEV`, `RELAY_HOST`, `RELAY_PORT`
-- `RELAY_TLS_CERT`, `RELAY_TLS_KEY` (in process TLS, optional)
-- `RELAY_SQLITE_PATH`, `RELAY_QUEUE_MAX`, `RELAY_QUEUE_TTL_SECONDS`
-- `RELAY_RATE_MAX_PER_MIN`, `RELAY_MAX_MESSAGE_BYTES`
-- `RELAY_TURN_SECRET`, `RELAY_TURN_URLS`, `RELAY_TURN_TTL_SECONDS` (optional voice calls)
-- `APNS_*` (optional iOS push)
-
-## Storage
-
-Storage sits behind a small `Storage` interface (`src/storage/interface.ts`) with a
-`better-sqlite3` implementation as the default. Swap in Postgres or Redis later without
-touching the relay logic. All key and ciphertext columns are opaque to the relay.
+Vars (in `wrangler.jsonc`): `QUEUE_MAX` (1000), `QUEUE_TTL_SECONDS` (30 days),
+`RATE_MAX_PER_MIN` (600, per handle), `MAX_MESSAGE_BYTES` (131072), `TURN_TTL_SECONDS`
+(7200), `APNS_HOST`. Secrets (via `wrangler secret put`): `TURN_KEY_ID`,
+`TURN_KEY_SECRET`, `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`. The `DEV`
+and `TURN_TEST` vars exist only for `wrangler dev` and the tests; never set them on a
+deployment.
 
 ## Security notes
 
-- The relay logs operational events only, never ciphertext or full who to whom maps beyond
-  what an operation needs. TURN credentials, usernames, and the shared secret are never
-  logged; the issued usernames are random ids rather than handles so coturn's own logs do
-  not accumulate a handle to call time map.
-- Rate limiting is in process (token bucket per connection). Behind multiple instances, move
-  limits and queues to a shared store. TURN credential requests share the same per ip
-  bucket; that is deliberate. A full call setup costs about five frames, and hoarding
-  credentials grants nothing (they are derived, not stored, and each expires on its own).
-  Actual relay bandwidth abuse is bounded where it happens, by coturn's quotas.
-- Keep the `.p8`, `coturn/turnserver.conf`, and any TLS keys out of git and mount them as
-  secrets.
+- The relay logs operational events only, never ciphertext, credentials, or full who to
+  whom maps. TURN credentials and the TURN key are never logged.
+- Rate limiting is a per handle token bucket inside each mailbox object; Cloudflare's own
+  DDoS and WAF layers sit in front of it.
+- Message queues live per handle in that handle's Durable Object (SQLite), capped by
+  `QUEUE_MAX` and swept by a per object alarm after `QUEUE_TTL_SECONDS`.
+- Delivery stays at least once: rows are deleted only on client ack and are redelivered
+  on every reconnect until then.

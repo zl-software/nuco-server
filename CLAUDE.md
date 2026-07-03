@@ -1,31 +1,35 @@
 # nuco-server
 
-The untrusted store and forward relay. It transports sealed ciphertext, hosts public prekey
-bundles, and sends content free push wakes. It can never read messages and holds no private
-keys. See `../CLAUDE.md` for the whole project and `../protocol/PROTOCOL.md` for the contract.
+The untrusted store and forward relay, running on Cloudflare Workers. One `MailboxDO`
+Durable Object per handle owns that handle's device record, prekey bundles, message queue
+(co-located SQLite), and live hibernated WebSocket. It transports sealed ciphertext, sends
+content free push wakes, and mints TURN credentials for calls. It can never read messages
+and holds no private keys. See `../CLAUDE.md` for the whole project and
+`../protocol/PROTOCOL.md` for the contract.
 
 Rules and invariants:
-- Never log ciphertext or full who to whom maps beyond what an operation needs. No readable
-  message content anywhere.
-- Minimal, auditable dependencies only: `ws`, `jose`, `better-sqlite3`, plus Node built ins
-  (`node:http`, `node:http2`). Do not add heavy frameworks.
+- Never log ciphertext, TURN credentials or keys, or full who to whom maps beyond what an
+  operation needs. No readable message content anywhere.
+- Minimal, auditable dependencies only: `jose` plus the platform (WebCrypto, fetch,
+  Durable Objects). `ws` exists as a devDependency for the Node test clients only.
 - The relay never does content crypto and never holds private keys. Socket auth verifies a
-  client Ed25519 signature over a challenge with Node built ins (`src/auth.ts`).
-- Storage sits behind `src/storage/interface.ts`; the SQLite impl is the default. Keep all
-  key and ciphertext columns opaque.
+  client Ed25519 signature over a challenge with WebCrypto (`src/auth.ts`).
+- Cross handle operations are DO to DO RPC (`deliver`, `takePreKeyBundle`); everything a
+  handle owns stays inside its own mailbox object. Delivery is at least once: ack deletes,
+  reconnect redelivers, dedupe by envelope id.
+- The static heartbeat ping (`{"type":"ping","ts":0}`) is answered by the runtime auto
+  response so hibernation is never broken by keepalives; do not make the ping dynamic.
+- APNs goes over plain fetch (the edge negotiates HTTP/2 to Apple in production; wrangler
+  dev cannot, so DEV mode mocks push). node:http2 does not exist on Workers.
 - No em dashes or en dashes. Commits look human authored (no AI attribution), conventional.
 
 Run and verify:
-- Dev: `npm run dev` (RELAY_DEV=1: no TLS, in memory SQLite, push mocked). Health at
-  `/health`.
+- Dev: `npm run dev` (wrangler dev with DEV=1: local workerd, push mocked, `/debug/state`).
 - `npm run typecheck`, `npm test` (WebSocket smoke test), `npm run test:e2e` (two headless
-  clients exchange a real sealed message; it imports app crypto from
-  `../nuco-messenger/src`, so it is excluded from `tsc` and validated by running).
-- Self hosting: `Dockerfile`, `docker-compose.yml` (with Caddy for TLS), see `README.md`.
-- APNs sending is `src/push/apns.ts` (node:http2 plus a jose ES256 JWT); runs without a `.p8`
-  if none is configured. UnifiedPush is a plain HTTPS POST.
-- Voice calls: `src/turn.ts` issues short lived TURN credentials (TURN REST scheme, HMAC via
-  node:crypto, random usernames so handles never reach coturn logs). Without RELAY_TURN_*
-  configured the relay answers CALLS_UNAVAILABLE. coturn is an opt in compose profile
-  (`docker compose --profile calls up -d`); see README "Voice calls (TURN)". Never log a
-  credential, username, or the secret.
+  clients exchange real sealed messages and call signaling; it imports app crypto from
+  `../nuco-messenger/src`). Both tests boot their own wrangler dev with fresh state.
+- Deploy: `wrangler deploy` (custom domain nuco-server.zlsoftware.at in `wrangler.jsonc`;
+  the zone must be on the account). Secrets via `wrangler secret put`: TURN_KEY_ID,
+  TURN_KEY_SECRET, APNS_KEY (p8 PEM), APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID.
+- Voice calls: TURN credentials come from Cloudflare Realtime TURN (`src/turn.ts`);
+  without the secrets the relay answers CALLS_UNAVAILABLE and messaging is unaffected.
