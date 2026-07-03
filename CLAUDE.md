@@ -24,3 +24,8 @@ Run and verify:
 - Self hosting: `Dockerfile`, `docker-compose.yml` (with Caddy for TLS), see `README.md`.
 - APNs sending is `src/push/apns.ts` (node:http2 plus a jose ES256 JWT); runs without a `.p8`
   if none is configured. UnifiedPush is a plain HTTPS POST.
+- Voice calls: `src/turn.ts` issues short lived TURN credentials (TURN REST scheme, HMAC via
+  node:crypto, random usernames so handles never reach coturn logs). Without RELAY_TURN_*
+  configured the relay answers CALLS_UNAVAILABLE. coturn is an opt in compose profile
+  (`docker compose --profile calls up -d`); see README "Voice calls (TURN)". Never log a
+  credential, username, or the secret.
