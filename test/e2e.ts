@@ -1,5 +1,6 @@
 // End to end harness: two headless clients that share the app's real crypto and transport
-// code run the full flow against a running relay, proving the contract without two phones.
+// code run the full flow against the Workers relay (real workerd via wrangler dev),
+// proving the contract without two phones.
 //   register -> publish prekeys -> fetch bundle -> X3DH session -> safety number match ->
 //   send a sealed (real Signal) message -> recipient receives, decrypts, asserts plaintext.
 // Also asserts the relay only ever holds ciphertext, that an offline recipient triggers a
@@ -20,12 +21,7 @@ import {
   type DecodedContent,
 } from '@nuco/protocol';
 
-import { SqliteStorage } from '../src/storage/sqlite.js';
-import { PushFanout } from '../src/push/sender.js';
-import { MockPushSender } from '../src/push/mock.js';
-import { RelayServer } from '../src/ws/server.js';
-import { createServer } from '../src/http/server.js';
-import { loadConfig } from '../src/config.js';
+import { startDevServer, debugState } from './dev-server';
 
 // Shared app code (pure, no React Native imports).
 import {
@@ -111,16 +107,10 @@ function waitFor(predicate: () => boolean, timeoutMs = 4000): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  process.env.RELAY_DEV = '1';
-  const config = { ...loadConfig(), port: 0 };
-  const storage = new SqliteStorage(':memory:');
-  const mock = new MockPushSender();
-  const relay = new RelayServer(config, storage, new PushFanout(null, null, mock));
-  const server = createServer(config);
-  relay.attach(server);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  console.log(`nuco end to end harness against relay on ${port}\n`);
+  console.log('booting wrangler dev for the end to end harness');
+  const server = await startDevServer(8801);
+  const port = server.port;
+  console.log(`nuco end to end harness against the workers relay on ${port}\n`);
 
   const alice = await makeClient(port, 'alice');
   const bob = await makeClient(port, 'bob');
@@ -247,11 +237,11 @@ async function main(): Promise<void> {
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
 
-  // Offline recipient: Carol registers, disconnects, then a send to her triggers a wake.
+  // Offline recipient: Carol registers, disconnects, then a send to her triggers a wake
+  // (mocked and counted by the dev relay).
   const carol = await makeClient(port, 'carol');
   carol.client.stop();
   await waitFor(() => !carol.client.isConnected());
-  const wakesBefore = mock.sent.length;
   const sealedToCarol = await bob.signal.encrypt('alice', utf8Encode('placeholder')).catch(() => null);
   // Bob has no session with carol; send a raw placeholder envelope to exercise the relay
   // wake path (delivery semantics are validated above with the real session).
@@ -261,14 +251,16 @@ async function main(): Promise<void> {
     messageType: 'whisper',
     sentAt: Date.now(),
   });
-  await waitFor(() => mock.sent.length > wakesBefore);
-  check(mock.sent.some((w) => w.handle === 'carol'), 'offline recipient triggered a content free push wake');
+  let carolWakes = 0;
+  await waitFor(() => {
+    void debugState(server, 'carol').then((s) => (carolWakes = s.wakes));
+    return carolWakes > 0;
+  });
+  check(carolWakes === 1, 'offline recipient triggered a content free push wake');
 
   alice.client.stop();
   bob.client.stop();
-  relay.close();
-  server.close();
-  storage.close();
+  server.stop();
 
   if (failures > 0) {
     console.error(`\nend to end harness FAILED with ${failures} failure(s)`);

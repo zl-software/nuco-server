@@ -18,10 +18,11 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250101.0",
     "@types/node": "^24.0.0",
-    "@types/ws": "^8.5.13",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.0.0",
+    "ws": "^8.21.0"
   },
   "allowScripts": {
     "workerd@1.20260701.1": true
