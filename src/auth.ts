@@ -1,30 +1,25 @@
-// Socket authentication. The relay issues a random challenge nonce and verifies the
-// client's Ed25519 signature over it using Node's built in crypto, so no Signal specific
-// crypto and no extra dependency are needed. The transport auth key is separate from the
-// Signal identity key.
+// Socket authentication: the client signs a random challenge with its Ed25519 transport
+// auth key (separate from the Signal identity key; see PROTOCOL.md). Verification uses the
+// runtime WebCrypto Ed25519 support; the relay never holds a private key.
 
-import { randomBytes, createPublicKey, verify } from 'node:crypto';
+import { base64ToBytes, bytesToBase64 } from './bytes';
 
 export function makeChallenge(): string {
-  return randomBytes(32).toString('base64');
+  const nonce = new Uint8Array(32);
+  crypto.getRandomValues(nonce);
+  return bytesToBase64(nonce);
 }
 
-export function verifyAuthSignature(
-  authKeyB64: string,
-  challengeB64: string,
-  signatureB64: string,
-): boolean {
+// authKeyB64 is a raw 32 byte Ed25519 public key, signatureB64 a 64 byte signature over
+// the raw challenge bytes. Any malformed input verifies false rather than throwing.
+export async function verifyAuthSignature(authKeyB64: string, challengeB64: string, signatureB64: string): Promise<boolean> {
   try {
-    const raw = Buffer.from(authKeyB64, 'base64');
-    if (raw.length !== 32) return false;
-    const sig = Buffer.from(signatureB64, 'base64');
-    if (sig.length !== 64) return false;
-    const pub = createPublicKey({
-      key: { kty: 'OKP', crv: 'Ed25519', x: raw.toString('base64url') },
-      format: 'jwk',
-    });
-    const message = Buffer.from(challengeB64, 'base64');
-    return verify(null, message, pub, sig);
+    const publicKey = base64ToBytes(authKeyB64);
+    const signature = base64ToBytes(signatureB64);
+    const message = base64ToBytes(challengeB64);
+    if (publicKey.length !== 32 || signature.length !== 64) return false;
+    const key = await crypto.subtle.importKey('raw', publicKey, { name: 'Ed25519' }, false, ['verify']);
+    return await crypto.subtle.verify({ name: 'Ed25519' }, key, signature, message);
   } catch {
     return false;
   }

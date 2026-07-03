@@ -1,99 +1,54 @@
-// APNs push sender. Sends a content free background wake directly to Apple over HTTP/2 with
-// an ES256 provider JWT signed by the .p8 key (jose). No Firebase, no third party library
-// for the transport. The payload carries no message content and no sender identity.
+// Content free APNs wake over fetch. The payload carries no message content and no sender
+// identity, only content-available so iOS wakes the app to pull from the relay.
+//
+// Transport note: Apple's provider API requires HTTP/2. Deployed Workers negotiate HTTP/2
+// to the origin at the edge, which is the established pattern for APNs from Workers, but
+// it is not exercisable under `wrangler dev` (local outbound fetch is HTTP/1.1 only), so
+// dev mode mocks push sending entirely; verify APNs against a deployed Worker.
 
-import { connect, constants, type ClientHttp2Session } from 'node:http2';
-import { readFileSync } from 'node:fs';
+import { SignJWT, importPKCS8 } from 'jose';
 
-import { importPKCS8, SignJWT } from 'jose';
+import type { Env } from '../env';
 
-import type { ApnsConfig } from '../config.js';
-import type { PushSender } from './sender.js';
-import type { DeviceRecord } from '../storage/interface.js';
+const TOKEN_TTL_MS = 45 * 60 * 1000; // Apple accepts provider tokens for up to an hour
 
-const TOKEN_TTL_MS = 45 * 60 * 1000; // refresh well under Apple's 1 hour limit
+// Cached per isolate; safe because the JWT carries no per device data.
+let cachedJwt: { token: string; mintedAt: number; keyId: string } | null = null;
 
-export class ApnsPushSender implements PushSender {
-  private session: ClientHttp2Session | null = null;
-  private signingKey: Awaited<ReturnType<typeof importPKCS8>> | null = null;
-  private token: { value: string; mintedAt: number } | null = null;
-
-  // onUnregistered is invoked with the handle when APNs reports the token is gone (410), so
-  // the caller can prune the dead token from storage.
-  constructor(
-    private readonly config: ApnsConfig,
-    private readonly onUnregistered?: (handle: string) => void,
-  ) {}
-
-  private async getSigningKey(): Promise<Awaited<ReturnType<typeof importPKCS8>>> {
-    if (!this.signingKey) {
-      const pem = readFileSync(this.config.keyPath, 'utf8');
-      this.signingKey = await importPKCS8(pem, 'ES256');
-    }
-    return this.signingKey;
+async function providerJwt(env: Env): Promise<string> {
+  const now = Date.now();
+  if (cachedJwt && cachedJwt.keyId === env.APNS_KEY_ID && now - cachedJwt.mintedAt < TOKEN_TTL_MS) {
+    return cachedJwt.token;
   }
+  const key = await importPKCS8(env.APNS_KEY!, 'ES256');
+  const token = await new SignJWT({})
+    .setProtectedHeader({ alg: 'ES256', kid: env.APNS_KEY_ID! })
+    .setIssuer(env.APNS_TEAM_ID!)
+    .setIssuedAt()
+    .sign(key);
+  cachedJwt = { token, mintedAt: now, keyId: env.APNS_KEY_ID! };
+  return token;
+}
 
-  private async getToken(now: number): Promise<string> {
-    if (this.token && now - this.token.mintedAt < TOKEN_TTL_MS) return this.token.value;
-    const key = await this.getSigningKey();
-    const value = await new SignJWT({})
-      .setProtectedHeader({ alg: 'ES256', kid: this.config.keyId })
-      .setIssuer(this.config.teamId)
-      .setIssuedAt(Math.floor(now / 1000))
-      .sign(key);
-    this.token = { value, mintedAt: now };
-    return value;
-  }
+export interface ApnsResult {
+  sent: boolean;
+  // HTTP 410: the token is no longer valid for the topic; the caller prunes it.
+  unregistered: boolean;
+}
 
-  private ensureSession(): ClientHttp2Session {
-    if (this.session && !this.session.closed && !this.session.destroyed) return this.session;
-    const session = connect(`https://${this.config.host}`);
-    session.on('error', () => session.destroy());
-    session.on('goaway', () => session.close());
-    this.session = session;
-    return session;
-  }
-
-  async sendWake(device: DeviceRecord): Promise<boolean> {
-    if (device.push.kind !== 'apns' || !device.push.token) return false;
-    const token = await this.getToken(Date.now());
-    const session = this.ensureSession();
-    const topic = device.push.apnsTopic ?? this.config.bundleId;
-    const payload = JSON.stringify({ aps: { 'content-available': 1 } });
-
-    return new Promise<boolean>((resolve) => {
-      const req = session.request({
-        [constants.HTTP2_HEADER_METHOD]: 'POST',
-        [constants.HTTP2_HEADER_PATH]: `/3/device/${device.push.token}`,
-        [constants.HTTP2_HEADER_AUTHORIZATION]: `Bearer ${token}`,
-        'apns-topic': topic,
-        'apns-push-type': 'background',
-        'apns-priority': '5',
-      });
-      let status = 0;
-      req.on('response', (headers) => {
-        status = Number(headers[constants.HTTP2_HEADER_STATUS] ?? 0);
-      });
-      req.on('error', () => resolve(false));
-      req.on('end', () => {
-        if (status === 410) {
-          // The device token is no longer registered with APNs. Prune it so we stop trying.
-          console.log(`[push:apns] token gone for ${device.handle} (410)`);
-          this.onUnregistered?.(device.handle);
-        }
-        resolve(status >= 200 && status < 300);
-      });
-      req.setEncoding('utf8');
-      req.on('data', () => {
-        // Drain any error body; we only act on the status.
-      });
-      req.write(payload);
-      req.end();
-    });
-  }
-
-  close(): void {
-    this.session?.close();
-    this.session = null;
-  }
+export async function sendApnsWake(env: Env, deviceToken: string, apnsTopic: string | undefined): Promise<ApnsResult> {
+  if (!env.APNS_KEY || !env.APNS_KEY_ID || !env.APNS_TEAM_ID) return { sent: false, unregistered: false };
+  const jwt = await providerJwt(env);
+  const host = env.APNS_HOST && env.APNS_HOST !== '' ? env.APNS_HOST : 'api.push.apple.com';
+  const res = await fetch(`https://${host}/3/device/${deviceToken}`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${jwt}`,
+      'apns-topic': apnsTopic ?? env.APNS_BUNDLE_ID ?? '',
+      'apns-push-type': 'background',
+      'apns-priority': '5',
+    },
+    body: JSON.stringify({ aps: { 'content-available': 1 } }),
+  });
+  return { sent: res.ok, unregistered: res.status === 410 };
 }

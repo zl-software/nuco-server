@@ -2,18 +2,16 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "outDir": "dist",
-    "rootDir": ".",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "types": ["node"]
+    "types": ["@cloudflare/workers-types"]
   },
-  "include": ["src", "test"],
-  "exclude": ["node_modules", "dist", "test/e2e.ts"]
+  "include": ["src"],
+  "exclude": ["node_modules", "test"]
 }

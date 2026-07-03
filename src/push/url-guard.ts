@@ -1,13 +1,9 @@
 // SSRF guard for user supplied push endpoints. A UnifiedPush endpoint is an arbitrary URL
-// the relay POSTs to when it wakes an offline device, so an attacker could register an
-// endpoint that points at internal infrastructure (cloud metadata, localhost admin ports,
-// private ranges) and use the relay as a confused deputy. Every endpoint is checked twice:
-// a cheap syntactic check at registration time, and a full check that resolves the host and
-// rejects private addresses right before the request is sent (which also defeats DNS
-// rebinding, where a name resolves public at registration and private at send time).
-
-import { isIP } from 'node:net';
-import { lookup } from 'node:dns/promises';
+// the relay POSTs to when it wakes an offline device. On Workers there is no resolver API
+// for a pre-send DNS check, so the guard is syntactic: https only, no localhost, no
+// private literal IPs. The runtime itself cannot reach Cloudflare internal or link local
+// addresses from fetch, which covers the rebinding class the old Node resolver check
+// existed for.
 
 function ipv4IsPrivate(addr: string): boolean {
   const parts = addr.split('.').map((p) => Number.parseInt(p, 10));
@@ -27,24 +23,17 @@ function ipv4IsPrivate(addr: string): boolean {
 function ipv6IsPrivate(addr: string): boolean {
   const a = addr.toLowerCase();
   if (a === '::1' || a === '::') return true; // loopback, unspecified
-  // IPv4 mapped (::ffff:a.b.c.d): judge by the embedded IPv4.
   const mapped = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
   if (mapped) return ipv4IsPrivate(mapped[1]!);
-  if (a.startsWith('fe8') || a.startsWith('fe9') || a.startsWith('fea') || a.startsWith('feb')) return true; // fe80::/10 link local
+  if (a.startsWith('fe8') || a.startsWith('fe9') || a.startsWith('fea') || a.startsWith('feb')) return true; // fe80::/10
   if (a.startsWith('fc') || a.startsWith('fd')) return true; // fc00::/7 unique local
   return false;
 }
 
-function addressIsPrivate(addr: string): boolean {
-  const kind = isIP(addr);
-  if (kind === 4) return ipv4IsPrivate(addr);
-  if (kind === 6) return ipv6IsPrivate(addr);
-  return true; // not a parseable address: refuse
-}
+const IPV4_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 
-// Cheap check with no network I/O: must be an https URL whose host is not localhost and, if
-// the host is a literal IP, not a private one. Used to reject obviously hostile endpoints at
-// registration time.
+// Must be an https URL whose host is not localhost and, if the host is a literal IP, not a
+// private one. Checked at registration time and again right before every send.
 export function isSyntacticallyPublicHttpsUrl(raw: string): boolean {
   let url: URL;
   try {
@@ -56,21 +45,7 @@ export function isSyntacticallyPublicHttpsUrl(raw: string): boolean {
   const host = url.hostname.replace(/^\[|\]$/g, '');
   if (!host) return false;
   if (host === 'localhost' || host.endsWith('.localhost')) return false;
-  if (isIP(host) !== 0) return !addressIsPrivate(host);
+  if (IPV4_RE.test(host)) return !ipv4IsPrivate(host);
+  if (host.includes(':')) return !ipv6IsPrivate(host);
   return true;
-}
-
-// Full check used right before sending: syntactic, then resolve the hostname and reject if
-// any resolved address is private. Returns false on any resolution failure.
-export async function isSendablePushUrl(raw: string): Promise<boolean> {
-  if (!isSyntacticallyPublicHttpsUrl(raw)) return false;
-  const host = new URL(raw).hostname.replace(/^\[|\]$/g, '');
-  if (isIP(host) !== 0) return !addressIsPrivate(host); // literal IP already vetted above
-  try {
-    const results = await lookup(host, { all: true });
-    if (results.length === 0) return false;
-    return results.every((r) => !addressIsPrivate(r.address));
-  } catch {
-    return false;
-  }
 }

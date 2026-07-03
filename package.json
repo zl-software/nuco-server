@@ -1,29 +1,29 @@
 {
   "name": "nuco-server",
   "version": "1.0.0",
-  "description": "Nuco relay: an untrusted store and forward server for sealed ciphertext and content free push wakes.",
+  "description": "Nuco relay on Cloudflare Workers: an untrusted store and forward server for sealed ciphertext and content free push wakes.",
   "license": "MIT",
   "type": "module",
-  "main": "dist/index.js",
   "scripts": {
-    "dev": "RELAY_DEV=1 tsx watch src/index.ts",
-    "start": "node dist/index.js",
-    "build": "tsc -p tsconfig.json && mkdir -p dist/storage && cp src/storage/schema.sql dist/storage/schema.sql",
+    "dev": "wrangler dev --var DEV:1",
+    "deploy": "wrangler deploy",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx test/ws-smoke.ts",
     "test:e2e": "tsx test/e2e.ts"
   },
   "dependencies": {
     "@nuco/protocol": "file:../protocol",
-    "better-sqlite3": "^12.11.0",
-    "jose": "^6.2.0",
-    "ws": "^8.18.0"
+    "jose": "^6.2.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.11",
+    "@cloudflare/workers-types": "^4.20250101.0",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.5.13",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "wrangler": "^4.0.0"
+  },
+  "allowScripts": {
+    "workerd@1.20260701.1": true
   }
 }

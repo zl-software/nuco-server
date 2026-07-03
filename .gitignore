@@ -13,3 +13,4 @@ coturn/turnserver.conf
 data/
 *.sqlite
 *.sqlite-*
+.wrangler/
