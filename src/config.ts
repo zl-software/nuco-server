@@ -124,7 +124,13 @@ export function loadConfig(): Config {
     if (urls.length === 0 || !urls.every((u) => u.startsWith('turn:') || u.startsWith('turns:'))) {
       throw new Error('RELAY_TURN_URLS must be a comma separated list of turn: or turns: URLs');
     }
-    turn = { secret: turnSecret, urls, ttlSeconds: int('RELAY_TURN_TTL_SECONDS', 7200) };
+    const ttlSeconds = int('RELAY_TURN_TTL_SECONDS', 7200);
+    if (ttlSeconds <= 0) {
+      // A zero or negative TTL would mint already expired credentials: coturn rejects every
+      // allocation and calls silently never connect. Fail at startup like the checks above.
+      throw new Error('RELAY_TURN_TTL_SECONDS must be a positive number of seconds');
+    }
+    turn = { secret: turnSecret, urls, ttlSeconds };
   }
 
   return {
