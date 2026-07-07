@@ -294,6 +294,27 @@ async function main(): Promise<void> {
   await waitFor(() => responder.received.length >= 7);
   check(responder.received[6]?.content.t === 'screenshot/cancel', 'responder received the cancel');
 
+  // Reply references and message deletion (protocol 2.3) ride the same sealed channel.
+  // The reference names the quoted message by its envelope id (both peers key a text by
+  // the same id), and the optional field must survive sealing, padding, and the relay.
+  const quotedId = randomUUID();
+  await sendSealed(initiator, responder.handle, { t: 'text', body: 'a reply', replyTo: quotedId });
+  await waitFor(() => responder.received.length >= 8);
+  const replyRef = responder.received[7];
+  check(
+    replyRef?.content.t === 'text' && replyRef.content.body === 'a reply' && replyRef.content.replyTo === quotedId,
+    'responder received the text with its reply reference intact',
+  );
+
+  const deleteWire = await sendSealed(initiator, responder.handle, { t: 'message/delete', id: quotedId });
+  await waitFor(() => responder.received.length >= 9);
+  const deleteReq = responder.received[8];
+  check(
+    deleteReq?.content.t === 'message/delete' && deleteReq.content.id === quotedId,
+    'responder received the delete request for the same id',
+  );
+  check(!utf8Decode(Buffer.from(deleteWire, 'base64')).includes('message/delete'), 'the delete request is opaque on the wire');
+
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
 
