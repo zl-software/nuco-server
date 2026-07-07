@@ -1,16 +1,24 @@
 // Nuco relay on Cloudflare Workers. One MailboxDO per handle holds the device record,
-// prekeys, message queue, and the live hibernated WebSocket. Deploy with `wrangler deploy`
-// (the zlsoftware.at zone must be on the deploying account for the custom domain).
+// prekeys, message queue, and the live hibernated WebSocket.
 //
-// Secrets (set with `wrangler secret put <NAME>`): TURN_KEY_ID, TURN_KEY_SECRET (voice
-// calls via Cloudflare Realtime TURN; omit both to run without calls), APNS_KEY (the .p8
-// PEM content), APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (iOS push; omit to run without).
+// The top level config is the self hosting default: a bare `wrangler deploy` ships to
+// your account's workers.dev subdomain with no edits needed. The reference deployment at
+// nuco-server.zlsoftware.at lives in the `production` env: `wrangler deploy --env
+// production` (the explicit `name` there keeps it targeting the SAME worker as before
+// envs existed, so Durable Objects and secrets survive; the zlsoftware.at zone must be on
+// the deploying account). To use your own custom domain, add a `routes` entry like the
+// production one, with your domain, to the top level.
+//
+// Secrets (set with `wrangler secret put <NAME>`, per env: add `--env production` for the
+// reference deployment): TURN_KEY_ID, TURN_KEY_SECRET (voice calls via Cloudflare
+// Realtime TURN; omit both to run without calls), APNS_KEY (the .p8 PEM content),
+// APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (iOS push; omit to run without).
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "nuco-server",
   "main": "src/worker.ts",
   "compatibility_date": "2026-06-01",
-  "routes": [{ "pattern": "nuco-server.zlsoftware.at", "custom_domain": true }],
+  "workers_dev": true,
   "durable_objects": {
     "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
   },
@@ -23,5 +31,27 @@
     "TURN_TTL_SECONDS": "7200",
     "APNS_HOST": "api.push.apple.com"
   },
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  "env": {
+    "production": {
+      // The explicit name is load bearing: without it wrangler would deploy a fresh
+      // worker named nuco-server-production with empty Durable Objects and no secrets.
+      "name": "nuco-server",
+      "workers_dev": false,
+      "routes": [{ "pattern": "nuco-server.zlsoftware.at", "custom_domain": true }],
+      // Bindings and vars are not inherited into envs; keep these in sync with the top level.
+      "durable_objects": {
+        "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
+      },
+      "vars": {
+        "QUEUE_MAX": "1000",
+        "QUEUE_TTL_SECONDS": "2592000",
+        "RATE_MAX_PER_MIN": "600",
+        "MAX_MESSAGE_BYTES": "131072",
+        "TURN_TTL_SECONDS": "7200",
+        "APNS_HOST": "api.push.apple.com"
+      },
+      "observability": { "enabled": true }
+    }
+  }
 }

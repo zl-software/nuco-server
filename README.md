@@ -37,9 +37,15 @@ account. The app states all of this plainly on its About and Privacy screen.
 
 - Node 24 LTS and npm (for tooling; the relay itself runs on Workers).
 - A Cloudflare account on the Workers paid plan (Durable Objects).
-- The shared `@nuco/protocol` package in a sibling `protocol` folder (`file:../protocol`).
-  Clone both repos side by side and build it once:
-  `npm --prefix ../protocol install && npm --prefix ../protocol run build`.
+- The shared [`@nuco/protocol`](https://github.com/zl-software/nuco-protocol) package in a
+  sibling folder named `protocol` (the `file:../protocol` dependency resolves against that
+  exact path). Clone both repos side by side and build the protocol once:
+
+  ```
+  git clone https://github.com/zl-software/nuco-server
+  git clone https://github.com/zl-software/nuco-protocol protocol
+  npm --prefix protocol install && npm --prefix protocol run build
+  ```
 
 ## Development
 
@@ -58,20 +64,33 @@ npm test           # server level WebSocket smoke test
 npm run test:e2e   # two headless clients exchange real sealed messages and call signaling
 ```
 
+`npm test` is self contained (it needs only the sibling protocol build). `npm run
+test:e2e` additionally imports the real app crypto and transport from a sibling
+`nuco-messenger` checkout; that repo is not public yet, so outside contributors cannot
+run the e2e harness. Typecheck and the smoke test cover the server on its own.
+
 ## Deployment
 
-The custom domain `nuco-server.zlsoftware.at` is configured in `wrangler.jsonc`; the
-`zlsoftware.at` zone must be on the deploying Cloudflare account (Cloudflare provisions
-the DNS record and certificate on deploy).
+Self hosting (the top level config in `wrangler.jsonc`): a bare deploy ships to your
+account's workers.dev subdomain with no config edits.
 
 ```
 npx wrangler login
 npx wrangler deploy
-curl https://nuco-server.zlsoftware.at/health
+curl https://nuco-server.<your-subdomain>.workers.dev/health
 ```
 
-The app's default server is `wss://nuco-server.zlsoftware.at`; a custom server can still
-be set in the app's Settings.
+Then point the app at `wss://nuco-server.<your-subdomain>.workers.dev` (Settings, then
+Server). For a custom domain, add a `routes` entry with `custom_domain: true` to the top
+level of `wrangler.jsonc` (the zone must be on your account; Cloudflare provisions the
+DNS record and certificate on deploy).
+
+The reference deployment at `nuco-server.zlsoftware.at` lives in the `production` env of
+the same config and deploys with `npx wrangler deploy --env production`; its secrets are
+set with `wrangler secret put <NAME> --env production`.
+
+The app's default server is `wss://nuco-server.zlsoftware.at`; a custom server can be set
+in the app's Settings.
 
 ## Voice calls (TURN)
 
@@ -134,3 +153,7 @@ deployment.
   `QUEUE_MAX` and swept by a per object alarm after `QUEUE_TTL_SECONDS`.
 - Delivery stays at least once: rows are deleted only on client ack and are redelivered
   on every reconnect until then.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

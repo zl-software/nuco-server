@@ -3,6 +3,16 @@
   "version": "1.0.0",
   "description": "Nuco relay on Cloudflare Workers: an untrusted store and forward server for sealed ciphertext and content free push wakes.",
   "license": "MIT",
+  "private": true,
+  "author": "ZL Software GmbH (https://zlsoftware.at)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zl-software/nuco-server.git"
+  },
+  "homepage": "https://github.com/zl-software/nuco-server#readme",
+  "bugs": {
+    "url": "https://github.com/zl-software/nuco-server/issues"
+  },
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --var DEV:1",

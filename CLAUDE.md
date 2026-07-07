@@ -29,8 +29,12 @@ Run and verify:
 - `npm run typecheck`, `npm test` (WebSocket smoke test), `npm run test:e2e` (two headless
   clients exchange real sealed messages and call signaling; it imports app crypto from
   `../nuco-messenger/src`). Both tests boot their own wrangler dev with fresh state.
-- Deploy: `wrangler deploy` (custom domain nuco-server.zlsoftware.at in `wrangler.jsonc`;
-  the zone must be on the account). Secrets via `wrangler secret put`: TURN_KEY_ID,
-  TURN_KEY_SECRET, APNS_KEY (p8 PEM), APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID.
+- Deploy: the top level `wrangler.jsonc` config is the self hosting default (workers_dev,
+  no routes; a bare `wrangler deploy` works on any account). The reference deployment at
+  nuco-server.zlsoftware.at is the `production` env: `wrangler deploy --env production`
+  (the explicit env `name: "nuco-server"` keeps it targeting the same worker, so Durable
+  Objects and secrets survive; the zone must be on the account). Secrets via
+  `wrangler secret put <NAME> --env production`: TURN_KEY_ID, TURN_KEY_SECRET, APNS_KEY
+  (p8 PEM), APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID.
 - Voice calls: TURN credentials come from Cloudflare Realtime TURN (`src/turn.ts`);
   without the secrets the relay answers CALLS_UNAVAILABLE and messaging is unaffected.
