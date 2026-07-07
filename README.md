@@ -1,10 +1,11 @@
 # nuco-server
 
-The Nuco relay: an untrusted store and forward server for sealed ciphertext, public prekey
-bundles, content free push wakes, and TURN credentials for voice calls. It runs on
-Cloudflare Workers: one Durable Object per handle holds that handle's device record,
-prekeys, message queue, and live WebSocket (hibernated while idle). It can never read
-messages and holds no private keys.
+The Nuco relay: an untrusted store and forward server for sealed ciphertext, content free
+push wakes, and TURN credentials for voice calls. It runs on Cloudflare Workers: one
+Durable Object per handle holds that handle's device record, message queue, and live
+WebSocket (hibernated while idle). It can never read messages and holds no key material
+at all beyond the transport auth public key (since protocol 2.0 all Signal keys travel
+only inside the in person QR contact card).
 
 See `../protocol/PROTOCOL.md` for the wire contract this server implements.
 
@@ -23,10 +24,10 @@ account. The app states all of this plainly on its About and Privacy screen.
 - `src/worker.ts`: entry. `/health`, WebSocket routing (the client carries its handle in
   the URL query since protocol 1.4), dev only `/debug/state`.
 - `src/mailbox.ts`: `MailboxDO`, one Durable Object per handle. Co-located SQLite holds
-  the device record, prekeys, and inbox; the socket is a hibernatable WebSocket (the
-  static heartbeat ping is answered at the edge without waking the object). Cross handle
-  operations (`send`, `fetchPreKeyBundle`) are DO to DO RPC. A per object alarm sweeps
-  expired queued messages.
+  the device record and inbox; the socket is a hibernatable WebSocket (the static
+  heartbeat ping is answered at the edge without waking the object). The only cross
+  handle operation (`send`) is DO to DO RPC. A per object alarm sweeps expired queued
+  messages.
 - `src/auth.ts`: Ed25519 challenge verification via WebCrypto.
 - `src/push/`: APNs (ES256 JWT via jose, sent with fetch) and UnifiedPush (plain POST,
   SSRF guarded). Payloads are content free.

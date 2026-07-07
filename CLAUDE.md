@@ -1,11 +1,12 @@
 # nuco-server
 
 The untrusted store and forward relay, running on Cloudflare Workers. One `MailboxDO`
-Durable Object per handle owns that handle's device record, prekey bundles, message queue
-(co-located SQLite), and live hibernated WebSocket. It transports sealed ciphertext, sends
-content free push wakes, and mints TURN credentials for calls. It can never read messages
-and holds no private keys. See `../CLAUDE.md` for the whole project and
-`../protocol/PROTOCOL.md` for the contract.
+Durable Object per handle owns that handle's device record, message queue (co-located
+SQLite), and live hibernated WebSocket. It transports sealed ciphertext, sends content
+free push wakes, and mints TURN credentials for calls. It can never read messages and,
+since protocol 2.0, holds no Signal key material at all (prekeys travel only inside the
+QR contact card; registration carries just the transport auth key and push routing). See
+`../CLAUDE.md` for the whole project and `../protocol/PROTOCOL.md` for the contract.
 
 Rules and invariants:
 - Never log ciphertext, TURN credentials or keys, or full who to whom maps beyond what an
@@ -14,9 +15,9 @@ Rules and invariants:
   Durable Objects). `ws` exists as a devDependency for the Node test clients only.
 - The relay never does content crypto and never holds private keys. Socket auth verifies a
   client Ed25519 signature over a challenge with WebCrypto (`src/auth.ts`).
-- Cross handle operations are DO to DO RPC (`deliver`, `takePreKeyBundle`); everything a
-  handle owns stays inside its own mailbox object. Delivery is at least once: ack deletes,
-  reconnect redelivers, dedupe by envelope id.
+- The only cross handle operation is DO to DO RPC `deliver`; everything a handle owns
+  stays inside its own mailbox object. Delivery is at least once: ack deletes, reconnect
+  redelivers, dedupe by envelope id.
 - The static heartbeat ping (`{"type":"ping","ts":0}`) is answered by the runtime auto
   response so hibernation is never broken by keepalives; do not make the ping dynamic.
 - APNs goes over plain fetch (the edge negotiates HTTP/2 to Apple in production; wrangler
