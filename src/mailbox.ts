@@ -1,13 +1,14 @@
 // The mailbox Durable Object: exactly one per handle (idFromName). It owns the handle's
-// device record, prekey bundles, and message queue in its co-located SQLite storage, and
-// holds the handle's live WebSocket via the hibernation API (zero cost while idle; the
-// static ping is answered from the edge without waking the object).
+// device record and message queue in its co-located SQLite storage, and holds the
+// handle's live WebSocket via the hibernation API (zero cost while idle; the static ping
+// is answered from the edge without waking the object).
 //
-// Frame handling mirrors the wire contract in ../protocol/PROTOCOL.md. Frames that touch
-// another handle (send, fetchPreKeyBundle) call that handle's mailbox over DO RPC; the
+// Frame handling mirrors the wire contract in ../protocol/PROTOCOL.md. The only frame
+// that touches another handle (send) calls that handle's mailbox over DO RPC; the
 // receiving side enqueues (delivery stays at least once, ack deletes, dedupe by envelope
 // id) and either live delivers or triggers a content free push wake. The relay never sees
-// plaintext, never holds a private key, and never logs ciphertext or credentials.
+// plaintext, never holds a private key or any end to end key material (since protocol 2.0
+// not even public identity keys), and never logs ciphertext or credentials.
 
 import { DurableObject } from 'cloudflare:workers';
 
@@ -18,8 +19,6 @@ import {
   PROTOCOL_VERSION,
   type ClientMessage,
   type MessageEnvelope,
-  type PreKeyBundle,
-  type PreKeyUpload,
   type PushRegistration,
   type ServerMessage,
 } from '@nuco/protocol';
@@ -45,9 +44,7 @@ interface SessionState {
 
 // A type literal (not an interface) so it satisfies the sql.exec Record constraint.
 type DeviceRow = {
-  identity_key: string;
   auth_key: string;
-  registration_id: number;
   device_id: number;
   push_kind: string;
   push_token: string | null;
@@ -79,9 +76,7 @@ export class MailboxDO extends DurableObject<Env> {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS device (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        identity_key TEXT NOT NULL,
         auth_key TEXT NOT NULL,
-        registration_id INTEGER NOT NULL,
         device_id INTEGER NOT NULL,
         push_kind TEXT NOT NULL,
         push_token TEXT,
@@ -89,16 +84,6 @@ export class MailboxDO extends DurableObject<Env> {
         apns_topic TEXT,
         created_at INTEGER NOT NULL,
         last_seen INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS signed_prekey (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        key_id INTEGER NOT NULL,
-        public_key TEXT NOT NULL,
-        signature TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS onetime_prekeys (
-        key_id INTEGER PRIMARY KEY,
-        public_key TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS inbox (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,7 +199,7 @@ export class MailboxDO extends DurableObject<Env> {
           this.fail(ws, ErrorCode.MalformedMessage, msg.rid);
           return;
         }
-        this.registerDevice(msg.identityKey, msg.authKey, msg.registrationId, msg.deviceId, msg.push, existing?.created_at);
+        this.registerDevice(msg.authKey, msg.deviceId, msg.push, existing?.created_at);
         if (isDev(this.env)) console.log(`[relay] registered ${session.handle}`);
         this.send(ws, { type: 'ok', rid: msg.rid });
         return;
@@ -246,36 +231,6 @@ export class MailboxDO extends DurableObject<Env> {
         this.send(ws, { type: 'authenticated' });
         this.sweepExpired();
         this.deliverQueued(ws);
-        return;
-      }
-
-      case 'publishPreKeys': {
-        if (!this.requireAuth(ws, session, msg.rid)) return;
-        this.publishPreKeys(msg.preKeys);
-        this.send(ws, { type: 'ok', rid: msg.rid, data: { oneTimeCount: this.countOneTimePreKeys() } });
-        return;
-      }
-
-      case 'fetchPreKeyBundle': {
-        if (!this.requireAuth(ws, session, msg.rid)) return;
-        const stub = this.env.MAILBOX.get(this.env.MAILBOX.idFromName(msg.handle));
-        const bundle = await stub.takePreKeyBundle(msg.handle);
-        if (!bundle) {
-          this.fail(ws, ErrorCode.NoSuchHandle, msg.rid);
-          return;
-        }
-        this.send(ws, { type: 'preKeyBundle', rid: msg.rid, bundle });
-        return;
-      }
-
-      case 'preKeyCount': {
-        if (!this.requireAuth(ws, session, msg.rid)) return;
-        this.send(ws, {
-          type: 'preKeyCountResult',
-          rid: msg.rid,
-          hasSignedPreKey: this.ctx.storage.sql.exec('SELECT COUNT(*) AS n FROM signed_prekey').one().n === 1,
-          oneTimeCount: this.countOneTimePreKeys(),
-        });
         return;
       }
 
@@ -392,29 +347,6 @@ export class MailboxDO extends DurableObject<Env> {
     return { ok: true, seq, delivered };
   }
 
-  // The fetching side calls the TARGET's mailbox. Pops one one time prekey per fetch; the
-  // bundle may omit it when the pool is empty.
-  async takePreKeyBundle(handle: string): Promise<PreKeyBundle | null> {
-    const device = this.getDevice();
-    if (!device) return null;
-    const signed = this.ctx.storage.sql
-      .exec<{ key_id: number; public_key: string; signature: string }>('SELECT key_id, public_key, signature FROM signed_prekey WHERE id = 1')
-      .toArray()[0];
-    if (!signed) return null;
-    const oneTime = this.ctx.storage.sql
-      .exec<{ key_id: number; public_key: string }>('SELECT key_id, public_key FROM onetime_prekeys ORDER BY key_id LIMIT 1')
-      .toArray()[0];
-    if (oneTime) this.ctx.storage.sql.exec('DELETE FROM onetime_prekeys WHERE key_id = ?', oneTime.key_id);
-    return {
-      handle,
-      deviceId: device.device_id,
-      registrationId: device.registration_id,
-      identityKey: device.identity_key,
-      signedPreKey: { keyId: signed.key_id, publicKey: signed.public_key, signature: signed.signature },
-      ...(oneTime ? { oneTimePreKey: { keyId: oneTime.key_id, publicKey: oneTime.public_key } } : {}),
-    };
-  }
-
   // Dev only debug surface (gated in the worker).
   async debugState(): Promise<{ queueDepth: number; wakes: number }> {
     return { queueDepth: this.queueDepth(), wakes: (this.ctx.storage.kv.get('wakes') as number | undefined) ?? 0 };
@@ -444,21 +376,12 @@ export class MailboxDO extends DurableObject<Env> {
     return this.ctx.storage.sql.exec<DeviceRow>('SELECT * FROM device WHERE id = 1').toArray()[0];
   }
 
-  private registerDevice(
-    identityKey: string,
-    authKey: string,
-    registrationId: number,
-    deviceId: number,
-    push: PushRegistration,
-    createdAt: number | undefined,
-  ): void {
+  private registerDevice(authKey: string, deviceId: number, push: PushRegistration, createdAt: number | undefined): void {
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO device (id, identity_key, auth_key, registration_id, device_id, push_kind, push_token, push_endpoint, apns_topic, created_at, last_seen)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      identityKey,
+      `INSERT OR REPLACE INTO device (id, auth_key, device_id, push_kind, push_token, push_endpoint, apns_topic, created_at, last_seen)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
       authKey,
-      registrationId,
       deviceId,
       push.kind,
       push.token ?? null,
@@ -467,22 +390,6 @@ export class MailboxDO extends DurableObject<Env> {
       createdAt ?? now,
       now,
     );
-  }
-
-  private publishPreKeys(upload: PreKeyUpload): void {
-    this.ctx.storage.sql.exec(
-      'INSERT OR REPLACE INTO signed_prekey (id, key_id, public_key, signature) VALUES (1, ?, ?, ?)',
-      upload.signedPreKey.keyId,
-      upload.signedPreKey.publicKey,
-      upload.signedPreKey.signature,
-    );
-    for (const otp of upload.oneTimePreKeys) {
-      this.ctx.storage.sql.exec('INSERT OR REPLACE INTO onetime_prekeys (key_id, public_key) VALUES (?, ?)', otp.keyId, otp.publicKey);
-    }
-  }
-
-  private countOneTimePreKeys(): number {
-    return Number(this.ctx.storage.sql.exec('SELECT COUNT(*) AS n FROM onetime_prekeys').one().n);
   }
 
   private queueDepth(): number {

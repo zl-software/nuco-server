@@ -1,7 +1,7 @@
 // Worker entry: health, WebSocket routing, and dev only debug endpoints. Every socket is
-// routed to the mailbox Durable Object named by the handle in the URL query (protocol 1.4)
-// so the connection, queue, and prekeys live together; everything else happens inside the
-// mailbox (src/mailbox.ts).
+// routed to the mailbox Durable Object named by the handle in the URL query so the
+// connection and queue live together; everything else happens inside the mailbox
+// (src/mailbox.ts).
 
 import { LIMITS } from '@nuco/protocol';
 

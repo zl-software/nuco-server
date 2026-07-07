@@ -1,9 +1,8 @@
 // Server level smoke test: drives the Workers relay (real workerd via wrangler dev) over
 // real WebSockets with an Ed25519 auth key and placeholder ciphertext, exercising connect,
-// register, authenticate, prekey publish and fetch, live delivery, ack, TURN credential
-// issuance, the offline push wake, and the transport rules added in protocol 1.4 (handle
-// in the URL, static ping auto response). Real Signal crypto is exercised by the two
-// client end to end harness (test/e2e.ts).
+// register, authenticate, live delivery, ack, TURN credential issuance, the offline push
+// wake, and the transport rules (handle in the URL, static ping auto response). Real
+// Signal crypto is exercised by the two client end to end harness (test/e2e.ts).
 //
 // Run: npx tsx test/ws-smoke.ts
 
@@ -14,7 +13,6 @@ import {
   PROTOCOL_VERSION,
   type ServerMessage,
   type MessageEnvelope,
-  type PreKeyUpload,
 } from '@nuco/protocol';
 
 import { startDevServer, debugState, type DevServer } from './dev-server';
@@ -111,7 +109,7 @@ class Client {
     });
   }
 
-  async handshake(identityKeyB64: string): Promise<void> {
+  async handshake(): Promise<void> {
     const connected = this.once((m) => m.type === 'connected' || m.type === 'error');
     this.send({ type: 'connect', protocolVersion: PROTOCOL_VERSION, handle: this.handle });
     const c = await connected;
@@ -124,9 +122,7 @@ class Client {
     await this.request((rid) => ({
       type: 'register',
       rid,
-      identityKey: identityKeyB64,
       authKey: this.auth.publicB64,
-      registrationId: 1,
       deviceId: 1,
       push: { kind: 'apns', token: 'devtoken', apnsTopic: 'com.example' },
     }));
@@ -138,12 +134,6 @@ class Client {
     if (a.type !== 'authenticated') throw new Error('auth failed');
   }
 
-  publishPreKeys(upload: PreKeyUpload): Promise<ServerMessage> {
-    return this.request((rid) => ({ type: 'publishPreKeys', rid, preKeys: upload }));
-  }
-  fetchBundle(handle: string): Promise<ServerMessage> {
-    return this.request((rid) => ({ type: 'fetchPreKeyBundle', rid, handle }));
-  }
   sendMessage(to: string, envelope: MessageEnvelope): Promise<ServerMessage> {
     return this.request((rid) => ({ type: 'send', rid, to, envelope }));
   }
@@ -164,16 +154,6 @@ class Client {
   }
 }
 
-function dummyUpload(seed: number): PreKeyUpload {
-  return {
-    signedPreKey: { keyId: 1, publicKey: Buffer.from(`spk${seed}`).toString('base64'), signature: Buffer.from('sig').toString('base64') },
-    oneTimePreKeys: [
-      { keyId: 1, publicKey: Buffer.from(`otp${seed}a`).toString('base64') },
-      { keyId: 2, publicKey: Buffer.from(`otp${seed}b`).toString('base64') },
-    ],
-  };
-}
-
 async function main(): Promise<void> {
   console.log('booting wrangler dev for the smoke test');
   const server = await startDevServer(8800, { TURN_TEST: '1' });
@@ -181,14 +161,12 @@ async function main(): Promise<void> {
   try {
     const aliceAuth = makeAuthKeys();
     const bobAuth = makeAuthKeys();
-    const aliceIdentity = Buffer.from('alice-identity').toString('base64');
-    const bobIdentity = Buffer.from('bob-identity').toString('base64');
 
     const alice = await Client.connect(server, 'alice', aliceAuth);
     const bob = await Client.connect(server, 'bob', bobAuth);
 
-    await alice.handshake(aliceIdentity);
-    await bob.handshake(bobIdentity);
+    await alice.handshake();
+    await bob.handshake();
     check(true, 'both clients registered and authenticated');
 
     // Transport rule (1.4): a socket without a handle in the URL is rejected at upgrade.
@@ -212,16 +190,19 @@ async function main(): Promise<void> {
     alice.send({ type: 'ping', ts: 0 });
     check((await pong).type === 'pong', 'static ping answered');
 
-    const pubResult = await alice.publishPreKeys(dummyUpload(1));
-    check(pubResult.type === 'ok' && (pubResult.data?.oneTimeCount as number) === 2, 'alice published prekeys (2 one time)');
+    // A prekey era frame is no longer part of the protocol and fails validation. The
+    // malformed reply carries no rid, so listen for it instead of correlating.
+    const retiredReply = alice.once((m) => m.type === 'error');
+    alice.send({ type: 'preKeyCount', rid: 'r-retired' });
+    const retired = await retiredReply;
+    check(retired.type === 'error' && retired.code === 'MALFORMED_MESSAGE', 'retired prekey frame rejected as malformed');
 
-    const bundleMsg = await bob.fetchBundle('alice');
-    check(bundleMsg.type === 'preKeyBundle', 'bob fetched alice prekey bundle');
-    if (bundleMsg.type === 'preKeyBundle') {
-      check(bundleMsg.bundle.identityKey === aliceIdentity, 'bundle carries alice identity key');
-      check(bundleMsg.bundle.oneTimePreKey?.keyId === 1, 'bundle popped one time prekey id 1');
-    }
-    const missing = await bob.fetchBundle('nobody-here');
+    const missing = await bob.sendMessage('nobody-here', {
+      id: 'msg-0',
+      ciphertext: Buffer.from('x').toString('base64'),
+      messageType: 'whisper',
+      sentAt: 1,
+    });
     check(missing.type === 'error' && missing.code === 'NO_SUCH_HANDLE', 'unknown handle yields NO_SUCH_HANDLE');
 
     // Live delivery: alice is connected, bob sends, alice receives and acks.
@@ -244,7 +225,7 @@ async function main(): Promise<void> {
     // Offline wake: a third handle registered but not connected triggers a push wake
     // (mocked and counted in dev mode).
     const carol = await Client.connect(server, 'carol', makeAuthKeys());
-    await carol.handshake(Buffer.from('carol-identity').toString('base64'));
+    await carol.handshake();
     carol.close();
     await new Promise((r) => setTimeout(r, 200));
     await bob.sendMessage('carol', { id: 'msg-2', ciphertext: Buffer.from('x').toString('base64'), messageType: 'whisper', sentAt: 1 });
@@ -298,7 +279,7 @@ async function main(): Promise<void> {
   const bare = await startDevServer(8802);
   try {
     const erin = await Client.connect(bare, 'erin', makeAuthKeys());
-    await erin.handshake(Buffer.from('erin-identity').toString('base64'));
+    await erin.handshake();
     const unavailable = await erin.turnCredentials();
     check(unavailable.type === 'error' && unavailable.code === 'CALLS_UNAVAILABLE', 'relay without turn answers CALLS_UNAVAILABLE');
     erin.close();
