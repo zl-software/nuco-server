@@ -3,7 +3,8 @@
 // wrangler dev), proving the contract without two phones.
 //   register (no key material) -> exchange contact cards out of band (the QR) ->
 //   deterministic initiator runs X3DH offline -> verify/confirm exchange with the card
-//   hash proof in both directions -> sealed text both ways -> call signaling.
+//   hash proof in both directions -> sealed text both ways -> call signaling -> the
+//   screenshot protection request/accept/cancel trio.
 // Also asserts the relay only ever holds ciphertext, that an offline recipient triggers a
 // content free push wake, and that a prekey envelope held unacked (the unknown sender
 // rule) survives at the relay and redelivers after a reconnect, exactly what the app does
@@ -269,6 +270,29 @@ async function main(): Promise<void> {
     stale !== undefined && stale.receivedAt - stale.sentAt >= CALL_OFFER_STALE_SECONDS * 1000,
     'a late redelivered offer classifies as stale',
   );
+
+  // The screenshot protection negotiation rides the same sealed channel: request over,
+  // accept back, cancel over, all opaque to the relay.
+  const shotWire = await sendSealed(initiator, responder.handle, { t: 'screenshot/request', on: true });
+  await waitFor(() => responder.received.length >= 6);
+  const shotReq = responder.received[5];
+  check(
+    shotReq?.content.t === 'screenshot/request' && shotReq.content.on === true,
+    'responder received the screenshot protection request',
+  );
+  check(!utf8Decode(Buffer.from(shotWire, 'base64')).includes('screenshot'), 'screenshot negotiation is opaque on the wire');
+
+  await sendSealed(responder, initiator.handle, { t: 'screenshot/accept', on: true });
+  await waitFor(() => initiator.received.length >= 4);
+  const shotAccept = initiator.received[3];
+  check(
+    shotAccept?.content.t === 'screenshot/accept' && shotAccept.content.on === true,
+    'initiator received the accept, protection agreed on both ends',
+  );
+
+  await sendSealed(initiator, responder.handle, { t: 'screenshot/cancel' });
+  await waitFor(() => responder.received.length >= 7);
+  check(responder.received[6]?.content.t === 'screenshot/cancel', 'responder received the cancel');
 
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
