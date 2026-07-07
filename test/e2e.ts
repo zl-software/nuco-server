@@ -1,12 +1,15 @@
-// End to end harness: two headless clients that share the app's real crypto and transport
-// code run the full flow against the Workers relay (real workerd via wrangler dev),
-// proving the contract without two phones.
-//   register -> publish prekeys -> fetch bundle -> X3DH session -> safety number match ->
-//   send a sealed (real Signal) message -> recipient receives, decrypts, asserts plaintext.
+// End to end harness: headless clients that share the app's real crypto and transport
+// code run the full protocol 2.0 flow against the Workers relay (real workerd via
+// wrangler dev), proving the contract without two phones.
+//   register (no key material) -> exchange contact cards out of band (the QR) ->
+//   deterministic initiator runs X3DH offline -> verify/confirm exchange with the card
+//   hash proof in both directions -> sealed text both ways -> call signaling.
 // Also asserts the relay only ever holds ciphertext, that an offline recipient triggers a
-// content free push wake, and that voice call signaling (offer, answer, end) round trips
-// over the same sealed channel. Real WebRTC cannot run in Node, so call checks use a fake
-// SDP of realistic size and validate signaling, freshness, and glare rules only.
+// content free push wake, and that a prekey envelope held unacked (the unknown sender
+// rule) survives at the relay and redelivers after a reconnect, exactly what the app does
+// when the confirm of a not yet reciprocated scan arrives early. Real WebRTC cannot run
+// in Node, so call checks use a fake SDP of realistic size and validate signaling,
+// freshness, and glare rules only.
 //
 // Run: npx tsx test/e2e.ts
 
@@ -26,13 +29,14 @@ import { startDevServer, debugState } from './dev-server';
 // Shared app code (pure, no React Native imports).
 import {
   generateIdentity,
-  generatePreKeys,
+  generateSignedPreKey,
   installIdentity,
-  toUploadBundle,
+  toSignedPreKeyPublic,
   identityPublicKeyBase64,
   authPublicKeyBase64,
 } from '../../nuco-messenger/src/crypto/identity';
-import { NucoSignal } from '../../nuco-messenger/src/crypto/signal';
+import { NucoSignal, type SessionBootstrap } from '../../nuco-messenger/src/crypto/signal';
+import { computeCardHash, isSessionInitiator } from '../../nuco-messenger/src/crypto/verification';
 import { NucoSignalStore, InMemoryKvBackend } from '../../nuco-messenger/src/crypto/store';
 import { utf8Encode, utf8Decode } from '../../nuco-messenger/src/crypto/bytes';
 import { RelayClient, type WebSocketCtor } from '../../nuco-messenger/src/transport/relay';
@@ -53,45 +57,80 @@ interface ReceivedContent {
   receivedAt: number;
 }
 
+// What this client's QR card advertises, as the scanner consumes it.
+type Card = SessionBootstrap & { handle: string };
+
 interface HeadlessClient {
   handle: string;
   signal: NucoSignal;
   client: RelayClient;
   received: ReceivedContent[];
   identityKeyB64: string;
+  card: Card;
+  // Mirrors the app's unknown sender rule: until this client has "scanned" the sender, a
+  // prekey envelope is left unacked (held) so the relay keeps it queued for redelivery.
+  scanned: boolean;
+  heldPrekey: number;
 }
 
-async function makeClient(port: number, handle: string): Promise<HeadlessClient> {
+async function makeClient(port: number, handle: string, scanned = true): Promise<HeadlessClient> {
   const store = new NucoSignalStore(new InMemoryKvBackend());
   const id = await generateIdentity();
-  const pre = await generatePreKeys(id.identityKeyPair, 1, 1, 10);
-  await installIdentity(store, id, pre);
+  const signedPreKey = await generateSignedPreKey(id.identityKeyPair, 1);
+  await installIdentity(store, id, signedPreKey);
   const signal = new NucoSignal(store);
-  const received: ReceivedContent[] = [];
 
-  const client = new RelayClient({
+  const me: HeadlessClient = {
+    handle,
+    signal,
+    client: null as unknown as RelayClient,
+    received: [],
+    identityKeyB64: identityPublicKeyBase64(id),
+    card: {
+      handle,
+      identityKey: identityPublicKeyBase64(id),
+      registrationId: id.registrationId,
+      signedPreKey: toSignedPreKeyPublic(signedPreKey),
+    },
+    scanned,
+    heldPrekey: 0,
+  };
+
+  me.client = new RelayClient({
     url: `ws://127.0.0.1:${port}`,
     handle,
     authKeyPair: id.authKeyPair,
     WebSocketImpl: WebSocket as unknown as WebSocketCtor,
     registerOnConnect: {
-      identityKey: identityPublicKeyBase64(id),
       authKey: authPublicKeyBase64(id.authKeyPair),
-      registrationId: id.registrationId,
       deviceId: 1,
       push: { kind: 'apns', token: `token-${handle}`, apnsTopic: 'com.zlsoftware.nuco' },
     },
     autoReconnect: false,
     onDeliver: async (from, envelope) => {
+      if (!me.scanned && envelope.messageType === 'prekey') {
+        me.heldPrekey += 1;
+        return; // unacked on purpose: the relay must keep it queued
+      }
       const plaintext = await signal.decrypt(from, { ciphertext: envelope.ciphertext, messageType: envelope.messageType });
-      received.push({ from, content: decodeContent(plaintext), sentAt: envelope.sentAt, receivedAt: Date.now() });
-      client.ack(envelope.id);
+      me.received.push({ from, content: decodeContent(plaintext), sentAt: envelope.sentAt, receivedAt: Date.now() });
+      me.client.ack(envelope.id);
     },
   });
-  client.start();
-  await client.ensureReady();
-  await client.publishPreKeys(toUploadBundle(pre));
-  return { handle, signal, client, received, identityKeyB64: identityPublicKeyBase64(id) };
+  me.client.start();
+  await me.client.ensureReady();
+  return me;
+}
+
+async function sendSealed(sender: HeadlessClient, to: string, content: Parameters<typeof encodeContent>[0]): Promise<string> {
+  const sealed = await sender.signal.encrypt(to, encodeContent(content));
+  await sender.client.sendEnvelope(to, {
+    id: randomUUID(),
+    ciphertext: sealed.ciphertext,
+    messageType: sealed.messageType,
+    sentAt: Date.now(),
+  });
+  return sealed.ciphertext;
 }
 
 function waitFor(predicate: () => boolean, timeoutMs = 4000): Promise<void> {
@@ -114,12 +153,16 @@ async function main(): Promise<void> {
 
   const alice = await makeClient(port, 'alice');
   const bob = await makeClient(port, 'bob');
-  check(true, 'both clients registered, authenticated, and published prekeys');
+  check(true, 'both clients registered and authenticated without exposing key material');
 
-  // Bob fetches Alice's bundle and establishes a session (X3DH).
-  const bundle = await bob.client.fetchPreKeyBundle('alice');
-  check(bundle.identityKey === alice.identityKeyB64, 'fetched bundle carries Alice identity key');
-  await bob.signal.startSession('alice', bundle);
+  // Deterministic roles from the exchanged cards: exactly one side runs X3DH.
+  const aliceInitiates = isSessionInitiator(alice.identityKeyB64, bob.identityKeyB64);
+  check(aliceInitiates !== isSessionInitiator(bob.identityKeyB64, alice.identityKeyB64), 'exactly one side is the session initiator');
+  const initiator = aliceInitiates ? alice : bob;
+  const responder = aliceInitiates ? bob : alice;
+
+  // The initiator establishes the session fully offline from the responder's card.
+  await initiator.signal.startSession(responder.handle, responder.card);
 
   // Both derive the same safety number and emoji SAS (the in person verification check).
   const av = await alice.signal.verificationStrings('alice', 'bob', bob.identityKeyB64);
@@ -130,105 +173,96 @@ async function main(): Promise<void> {
     'emoji SAS matches on both sides',
   );
 
-  // Bob seals a real Signal message and sends it over the wire.
-  const plaintext = 'hello alice, sealed over the relay';
-  const sealed = await bob.signal.encrypt('alice', utf8Encode(plaintext));
-  await bob.client.sendEnvelope('alice', {
-    id: randomUUID(),
-    ciphertext: sealed.ciphertext,
-    messageType: sealed.messageType,
-    sentAt: Date.now(),
+  // The confirm exchange: the initiator's confirm is the session's first sealed message
+  // (a prekey envelope), carrying the hash of the responder's card as proof of the scan.
+  const confirmWire = await sendSealed(initiator, responder.handle, {
+    t: 'verify/confirm',
+    cardHash: computeCardHash(responder.card),
   });
-  await waitFor(() => alice.received.length >= 1);
-  const firstMsg = alice.received[0];
+  await waitFor(() => responder.received.length >= 1);
+  const inboundConfirm = responder.received[0];
+  check(inboundConfirm?.content.t === 'verify/confirm', 'responder received the confirm as the first sealed message');
   check(
-    firstMsg !== undefined && firstMsg.content.t === 'text' && firstMsg.content.body === plaintext,
-    'Alice received and decrypted the sealed message',
+    inboundConfirm?.content.t === 'verify/confirm' && inboundConfirm.content.cardHash === computeCardHash(responder.card),
+    'confirm proves possession of the responder card',
   );
-  check(firstMsg?.from === 'bob', 'message attributed to Bob');
+  check(!utf8Decode(Buffer.from(confirmWire, 'base64')).includes('verify/confirm'), 'confirm is opaque on the wire');
 
-  // The relay only ever holds ciphertext: the wire body does not contain the plaintext.
-  const sealedBytes = utf8Decode(Uint8Array.from(Buffer.from(sealed.ciphertext, 'base64')));
-  check(!sealedBytes.includes('sealed over the relay'), 'relay payload is ciphertext, not plaintext');
+  // The responder answers with its own confirm over the now materialized session.
+  await sendSealed(responder, initiator.handle, {
+    t: 'verify/confirm',
+    cardHash: computeCardHash(initiator.card),
+  });
+  await waitFor(() => initiator.received.length >= 1);
+  const replyConfirm = initiator.received[0];
+  check(
+    replyConfirm?.content.t === 'verify/confirm' && replyConfirm.content.cardHash === computeCardHash(initiator.card),
+    'initiator validated the responder confirm against its own card',
+  );
+  // The receive gate orders on this: both sides saw a confirm before any other content.
+  check(
+    initiator.received[0]?.content.t === 'verify/confirm' && responder.received[0]?.content.t === 'verify/confirm',
+    'no content preceded the confirm exchange on either side',
+  );
 
-  // Alice replies, exercising the ratchet the other way over the wire.
+  // A wrong card hash (here: the hash of the WRONG card) must not validate.
+  check(
+    computeCardHash(initiator.card) !== computeCardHash(responder.card),
+    'a confirm built without the receiver card cannot validate',
+  );
+
+  // Mutually verified: sealed text flows both ways over the wire.
+  const plaintext = 'hello, sealed over the relay';
+  const textWire = await sendSealed(initiator, responder.handle, { t: 'text', body: plaintext });
+  await waitFor(() => responder.received.length >= 2);
+  const firstMsg = responder.received[1];
+  check(firstMsg?.content.t === 'text' && firstMsg.content.body === plaintext, 'responder received and decrypted the sealed text');
+  check(firstMsg?.from === initiator.handle, 'message attributed to the initiator');
+  check(!utf8Decode(Buffer.from(textWire, 'base64')).includes('sealed over the relay'), 'relay payload is ciphertext, not plaintext');
+
   const reply = 'got it, talk soon';
-  const sealedReply = await alice.signal.encrypt('bob', utf8Encode(reply));
-  await alice.client.sendEnvelope('bob', {
-    id: randomUUID(),
-    ciphertext: sealedReply.ciphertext,
-    messageType: sealedReply.messageType,
-    sentAt: Date.now(),
-  });
-  await waitFor(() => bob.received.length >= 1);
-  const replyMsg = bob.received[0];
-  check(
-    replyMsg !== undefined && replyMsg.content.t === 'text' && replyMsg.content.body === reply,
-    'Bob received and decrypted the reply',
-  );
+  await sendSealed(responder, initiator.handle, { t: 'text', body: reply });
+  await waitFor(() => initiator.received.length >= 2);
+  const replyMsg = initiator.received[1];
+  check(replyMsg?.content.t === 'text' && replyMsg.content.body === reply, 'initiator received and decrypted the reply');
 
   // Voice call signaling rides the same sealed channel as typed content. The relay cannot
   // tell it apart from ordinary messages.
   const callId = randomUUID();
   const fakeSdp = 'v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n' + 'a=candidate:relay '.repeat(60);
-  const sealedOffer = await bob.signal.encrypt('alice', encodeContent({ t: 'call/offer', callId, sdp: fakeSdp }));
-  await bob.client.sendEnvelope('alice', {
-    id: randomUUID(),
-    ciphertext: sealedOffer.ciphertext,
-    messageType: sealedOffer.messageType,
-    sentAt: Date.now(),
-  });
-  await waitFor(() => alice.received.length >= 2);
-  const offer = alice.received[1];
+  const offerWire = await sendSealed(initiator, responder.handle, { t: 'call/offer', callId, sdp: fakeSdp });
+  await waitFor(() => responder.received.length >= 3);
+  const offer = responder.received[2];
   check(
     offer !== undefined && offer.content.t === 'call/offer' && offer.content.callId === callId && offer.content.sdp === fakeSdp,
-    'Alice received the sealed call offer intact',
+    'responder received the sealed call offer intact',
   );
   check(
     offer !== undefined && offer.receivedAt - offer.sentAt < CALL_OFFER_STALE_SECONDS * 1000,
     'a live offer is fresh under the staleness rule',
   );
-  const offerWire = utf8Decode(Uint8Array.from(Buffer.from(sealedOffer.ciphertext, 'base64')));
-  check(!offerWire.includes('call/offer'), 'call signaling is opaque on the wire');
+  check(!utf8Decode(Buffer.from(offerWire, 'base64')).includes('call/offer'), 'call signaling is opaque on the wire');
 
-  const sealedAnswer = await alice.signal.encrypt('bob', encodeContent({ t: 'call/answer', callId, sdp: fakeSdp }));
-  await alice.client.sendEnvelope('bob', {
-    id: randomUUID(),
-    ciphertext: sealedAnswer.ciphertext,
-    messageType: sealedAnswer.messageType,
-    sentAt: Date.now(),
-  });
-  await waitFor(() => bob.received.length >= 2);
-  const answer = bob.received[1];
-  check(
-    answer !== undefined && answer.content.t === 'call/answer' && answer.content.callId === callId,
-    'Bob received the call answer for the same call',
-  );
+  await sendSealed(responder, initiator.handle, { t: 'call/answer', callId, sdp: fakeSdp });
+  await waitFor(() => initiator.received.length >= 3);
+  const answer = initiator.received[2];
+  check(answer !== undefined && answer.content.t === 'call/answer' && answer.content.callId === callId, 'initiator received the call answer for the same call');
 
-  const sealedEnd = await bob.signal.encrypt('alice', encodeContent({ t: 'call/end', callId, reason: 'hangup' }));
-  await bob.client.sendEnvelope('alice', {
-    id: randomUUID(),
-    ciphertext: sealedEnd.ciphertext,
-    messageType: sealedEnd.messageType,
-    sentAt: Date.now(),
-  });
-  await waitFor(() => alice.received.length >= 3);
-  const end = alice.received[2];
-  check(
-    end !== undefined && end.content.t === 'call/end' && end.content.reason === 'hangup',
-    'Alice received the call end',
-  );
+  await sendSealed(initiator, responder.handle, { t: 'call/end', callId, reason: 'hangup' });
+  await waitFor(() => responder.received.length >= 4);
+  const end = responder.received[3];
+  check(end !== undefined && end.content.t === 'call/end' && end.content.reason === 'hangup', 'responder received the call end');
 
   // A queued offer redelivered late classifies as stale (missed call, never a ring).
-  const sealedStale = await bob.signal.encrypt('alice', encodeContent({ t: 'call/offer', callId: randomUUID(), sdp: fakeSdp }));
-  await bob.client.sendEnvelope('alice', {
+  const sealedStale = await initiator.signal.encrypt(responder.handle, encodeContent({ t: 'call/offer', callId: randomUUID(), sdp: fakeSdp }));
+  await initiator.client.sendEnvelope(responder.handle, {
     id: randomUUID(),
     ciphertext: sealedStale.ciphertext,
     messageType: sealedStale.messageType,
     sentAt: Date.now() - (CALL_OFFER_STALE_SECONDS * 1000 + 5000),
   });
-  await waitFor(() => alice.received.length >= 4);
-  const stale = alice.received[3];
+  await waitFor(() => responder.received.length >= 5);
+  const stale = responder.received[4];
   check(
     stale !== undefined && stale.receivedAt - stale.sentAt >= CALL_OFFER_STALE_SECONDS * 1000,
     'a late redelivered offer classifies as stale',
@@ -237,17 +271,40 @@ async function main(): Promise<void> {
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
 
-  // Offline recipient: Carol registers, disconnects, then a send to her triggers a wake
+  // The unknown sender rule: dave scanned erin, but erin has not scanned dave back. Dave's
+  // confirm (a prekey envelope) arrives at erin, who holds it UNACKED. It must survive at
+  // the relay and redeliver after erin "scans" and reconnects, then decrypt cleanly.
+  const dave = await makeClient(port, 'dave');
+  const erin = await makeClient(port, 'erin', false);
+  const daveInitiates = isSessionInitiator(dave.identityKeyB64, erin.identityKeyB64);
+  const scanner = daveInitiates ? dave : erin;
+  const late = daveInitiates ? erin : dave;
+  late.scanned = false;
+  scanner.scanned = true;
+  await scanner.signal.startSession(late.handle, late.card);
+  await sendSealed(scanner, late.handle, { t: 'verify/confirm', cardHash: computeCardHash(late.card) });
+  await waitFor(() => late.heldPrekey >= 1);
+  check(late.received.length === 0, 'unreciprocated confirm is held unacked, not processed');
+
+  late.scanned = true; // the scan happened; the app reconnects to drain the queue
+  late.client.stop();
+  await waitFor(() => !late.client.isConnected());
+  late.client.start();
+  await waitFor(() => late.received.length >= 1, 8000);
+  const lateConfirm = late.received[0];
+  check(
+    lateConfirm?.content.t === 'verify/confirm' && lateConfirm.content.cardHash === computeCardHash(late.card),
+    'held confirm redelivered after reconnect and decrypted',
+  );
+
+  // Offline recipient: carol registers, disconnects, then a send to her triggers a wake
   // (mocked and counted by the dev relay).
   const carol = await makeClient(port, 'carol');
   carol.client.stop();
   await waitFor(() => !carol.client.isConnected());
-  const sealedToCarol = await bob.signal.encrypt('alice', utf8Encode('placeholder')).catch(() => null);
-  // Bob has no session with carol; send a raw placeholder envelope to exercise the relay
-  // wake path (delivery semantics are validated above with the real session).
   await bob.client.sendEnvelope('carol', {
     id: randomUUID(),
-    ciphertext: (sealedToCarol?.ciphertext ?? Buffer.from('x').toString('base64')),
+    ciphertext: Buffer.from('x').toString('base64'),
     messageType: 'whisper',
     sentAt: Date.now(),
   });
@@ -260,6 +317,8 @@ async function main(): Promise<void> {
 
   alice.client.stop();
   bob.client.stop();
+  dave.client.stop();
+  erin.client.stop();
   server.stop();
 
   if (failures > 0) {
