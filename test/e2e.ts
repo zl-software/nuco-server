@@ -147,7 +147,9 @@ function waitFor(predicate: () => boolean, timeoutMs = 4000): Promise<void> {
 
 async function main(): Promise<void> {
   console.log('booting wrangler dev for the end to end harness');
-  const server = await startDevServer(8801);
+  // TURN_TEST gives the dev relay canned credentials, so the CLIENT side turnCredentials
+  // path is coverable end to end (its version gate once tripped on the 2.0 minor reset).
+  const server = await startDevServer(8801, { TURN_TEST: '1' });
   const port = server.port;
   console.log(`nuco end to end harness against the workers relay on ${port}\n`);
 
@@ -270,6 +272,12 @@ async function main(): Promise<void> {
 
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
+
+  // The app transport must fetch TURN credentials from a 2.x relay: the frame exists in
+  // every 2.x, and the client gate may only refuse a 1.x relay below minor 3 (gating on
+  // the minor alone broke when the 2.0 bump reset it to 0).
+  const turn = await alice.client.turnCredentials();
+  check(turn.urls.length > 0 && turn.credential.length > 0, 'client fetched turn credentials from a 2.x relay');
 
   // The unknown sender rule: dave scanned erin, but erin has not scanned dave back. Dave's
   // confirm (a prekey envelope) arrives at erin, who holds it UNACKED. It must survive at
