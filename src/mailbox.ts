@@ -6,9 +6,11 @@
 // Frame handling mirrors the wire contract in ../protocol/PROTOCOL.md. The only frame
 // that touches another handle (send) calls that handle's mailbox over DO RPC; the
 // receiving side enqueues (delivery stays at least once, ack deletes, dedupe by envelope
-// id) and either live delivers or triggers a content free push wake. The relay never sees
-// plaintext, never holds a private key or any end to end key material (since protocol 2.0
-// not even public identity keys), and never logs ciphertext or credentials.
+// id) and either live delivers or triggers a content free push (a generic visible banner
+// on APNs, an opaque wake on UnifiedPush; never message content or sender identity). The
+// relay never sees plaintext, never holds a private key or any end to end key material
+// (since protocol 2.0 not even public identity keys), and never logs ciphertext or
+// credentials.
 
 import { DurableObject } from 'cloudflare:workers';
 

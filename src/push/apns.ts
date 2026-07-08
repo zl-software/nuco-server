@@ -1,5 +1,9 @@
-// Content free APNs wake over fetch. The payload carries no message content and no sender
-// identity, only content-available so iOS wakes the app to pull from the relay.
+// Content free APNs push over fetch. The payload carries no message content and no sender
+// identity: a visible generic banner whose text is a fixed localization key that the app
+// bundle resolves on the device (Localizable.strings), so the relay stays locale blind.
+// The literal English sentence is the key on purpose: iOS renders the raw key when the
+// lookup fails, so builds without the strings file still show sensible text. A static
+// collapse id folds a queue of N messages into a single banner.
 //
 // Transport note: Apple's provider API requires HTTP/2. Deployed Workers negotiate HTTP/2
 // to the origin at the edge, which is the established pattern for APNs from Workers, but
@@ -55,10 +59,11 @@ export async function sendApnsWake(env: Env, deviceToken: string, apnsTopic: str
     headers: {
       authorization: `Bearer ${jwt}`,
       'apns-topic': apnsTopic ?? env.APNS_BUNDLE_ID ?? '',
-      'apns-push-type': 'background',
-      'apns-priority': '5',
+      'apns-push-type': 'alert',
+      'apns-priority': '10',
+      'apns-collapse-id': 'nuco',
     },
-    body: JSON.stringify({ aps: { 'content-available': 1 } }),
+    body: JSON.stringify({ aps: { alert: { 'loc-key': 'New message' }, sound: 'default' } }),
   });
   if (!res.ok && res.status !== 410) {
     // The APNs reason string ("InvalidProviderToken", "TopicDisallowed", ...) is safe to

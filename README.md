@@ -1,7 +1,7 @@
 # nuco-server
 
 The Nuco relay: an untrusted store and forward server for sealed ciphertext, content free
-push wakes, and TURN credentials for voice calls. It runs on Cloudflare Workers: one
+pushes, and TURN credentials for voice calls. It runs on Cloudflare Workers: one
 Durable Object per handle holds that handle's device record, message queue, and live
 WebSocket (hibernated while idle). It can never read messages and holds no key material
 at all beyond the transport auth public key (since protocol 2.0 all Signal keys travel
@@ -110,8 +110,9 @@ TURN usage is billed by Cloudflare per outbound GB; an hour of Opus voice is rou
 
 ## iOS push (APNs)
 
-The relay sends the wake directly to Apple with an ES256 provider token; the payload
-carries no content. To enable it:
+The relay sends the push directly to Apple with an ES256 provider token. The payload is
+content free: a generic visible banner whose text is a fixed localization key the app
+resolves on the device, never message content or sender identity. To enable it:
 
 1. Create an APNs Auth Key in the Apple Developer portal and download the `.p8`.
 2. `npx wrangler secret put APNS_KEY` (paste the full PEM content of the `.p8`), then
