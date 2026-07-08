@@ -23,7 +23,7 @@ import {
   type ServerMessage,
 } from '@nuco/protocol';
 
-import { intVar, isDev, type Env } from './env';
+import { intVar, ipRateKey, isDev, type Env } from './env';
 import { makeChallenge, verifyAuthSignature } from './auth';
 import { issueTurnCredentials } from './turn';
 import { sendApnsWake } from './push/apns';
@@ -40,6 +40,9 @@ interface SessionState {
   // authenticated budget; a small per socket allowance covers the handshake and then the
   // socket is closed.
   preAuthFrames: number;
+  // Hashed client IP (see ipRateKey), captured at upgrade for the new handle registration
+  // throttle. Never the raw IP. Empty on sessions attached before this field existed.
+  ipKey: string;
 }
 
 // A type literal (not an interface) so it satisfies the sql.exec Record constraint.
@@ -103,14 +106,20 @@ export class MailboxDO extends DurableObject<Env> {
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('expected websocket', { status: 426 });
     }
+    // Bound the number of concurrent sockets one mailbox will hold. Authenticated sockets
+    // already collapse to one (last wins), so this caps unauthenticated pileup.
+    if (this.ctx.getWebSockets().length >= intVar(this.env.SOCKETS_MAX_PER_HANDLE, 8)) {
+      return new Response('too many sockets', { status: 429 });
+    }
     // The worker routed this socket here by the handle in the URL, so by construction the
     // URL handle names this object; it becomes the session's expected handle.
     const handle = new URL(request.url).searchParams.get('handle') ?? '';
+    const ipKey = await ipRateKey(request.headers.get('CF-Connecting-IP') ?? 'local');
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
-    setSession(server, { handle, authenticated: false, challenge: null, preAuthFrames: 0 });
+    setSession(server, { handle, authenticated: false, challenge: null, preAuthFrames: 0, ipKey });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -193,6 +202,13 @@ export class MailboxDO extends DurableObject<Env> {
         // handle namespace); updating an existing one is not.
         if (existing && !session.authenticated) {
           this.fail(ws, ErrorCode.Unauthenticated, msg.rid);
+          return;
+        }
+        // New handle creation is throttled per client IP; authenticated updates (push
+        // token refresh) never touch the limiter.
+        if (!existing && !(await this.registerAllowed(session))) {
+          this.fail(ws, ErrorCode.RateLimited, msg.rid);
+          ws.close(1013, 'try later');
           return;
         }
         if (msg.push.kind === 'unifiedpush' && (!msg.push.endpoint || !isSyntacticallyPublicHttpsUrl(msg.push.endpoint))) {
@@ -437,6 +453,16 @@ export class MailboxDO extends DurableObject<Env> {
     }
   }
 
+  private async registerAllowed(session: SessionState): Promise<boolean> {
+    try {
+      const outcome = await this.env.REG_LIMIT?.limit({ key: session.ipKey || 'unknown' });
+      return outcome ? outcome.success : true;
+    } catch {
+      // Fail open: the binding is optional for self hosters and must never block onboarding.
+      return true;
+    }
+  }
+
   private requireAuth(ws: WebSocket, session: SessionState, rid?: string): boolean {
     if (!session.authenticated) {
       this.fail(ws, ErrorCode.Unauthenticated, rid);
@@ -477,7 +503,8 @@ export class MailboxDO extends DurableObject<Env> {
 }
 
 function getSession(ws: WebSocket): SessionState {
-  return (ws.deserializeAttachment() as SessionState | null) ?? { handle: '', authenticated: false, challenge: null, preAuthFrames: 0 };
+  const attached = ws.deserializeAttachment() as SessionState | null;
+  return attached ?? { handle: '', authenticated: false, challenge: null, preAuthFrames: 0, ipKey: '' };
 }
 
 function setSession(ws: WebSocket, session: SessionState): void {

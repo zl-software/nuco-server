@@ -8,7 +8,7 @@
 
 import { SignJWT, importPKCS8 } from 'jose';
 
-import type { Env } from '../env';
+import { apnsConfigState, type Env } from '../env';
 
 const TOKEN_TTL_MS = 45 * 60 * 1000; // Apple accepts provider tokens for up to an hour
 
@@ -36,8 +36,18 @@ export interface ApnsResult {
   unregistered: boolean;
 }
 
+// A partial secret set would silently no-op every push; complain once per isolate.
+let warnedPartial = false;
+
 export async function sendApnsWake(env: Env, deviceToken: string, apnsTopic: string | undefined): Promise<ApnsResult> {
-  if (!env.APNS_KEY || !env.APNS_KEY_ID || !env.APNS_TEAM_ID) return { sent: false, unregistered: false };
+  const state = apnsConfigState(env);
+  if (state !== 'ok') {
+    if (state === 'partial' && !warnedPartial) {
+      warnedPartial = true;
+      console.error('[push] apns config incomplete: set all of APNS_KEY, APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID, or none');
+    }
+    return { sent: false, unregistered: false };
+  }
   const jwt = await providerJwt(env);
   const host = env.APNS_HOST && env.APNS_HOST !== '' ? env.APNS_HOST : 'api.push.apple.com';
   const res = await fetch(`https://${host}/3/device/${deviceToken}`, {
@@ -50,5 +60,16 @@ export async function sendApnsWake(env: Env, deviceToken: string, apnsTopic: str
     },
     body: JSON.stringify({ aps: { 'content-available': 1 } }),
   });
+  if (!res.ok && res.status !== 410) {
+    // The APNs reason string ("InvalidProviderToken", "TopicDisallowed", ...) is safe to
+    // log: it never contains the token or the payload.
+    const reason = await res
+      .json()
+      .then((b) => (b as { reason?: string }).reason ?? 'unknown')
+      .catch(() => 'unknown');
+    console.error('[push] apns rejected', res.status, reason);
+    // An expired provider token would otherwise keep failing for up to TOKEN_TTL_MS.
+    if (res.status === 403) cachedJwt = null;
+  }
   return { sent: res.ok, unregistered: res.status === 410 };
 }

@@ -154,9 +154,36 @@ class Client {
   }
 }
 
+// Connect and register a brand new handle, returning 'ok' or the error code. Used to
+// exercise the per IP registration throttle (all local traffic shares one hashed key).
+async function registerOutcome(server: DevServer, handle: string): Promise<string> {
+  const auth = makeAuthKeys();
+  const c = await Client.connect(server, handle, auth);
+  const connected = c.once((m) => m.type === 'connected');
+  c.send({ type: 'connect', protocolVersion: PROTOCOL_VERSION, handle });
+  await connected;
+  const reply = await c.request((rid) => ({
+    type: 'register',
+    rid,
+    authKey: auth.publicB64,
+    deviceId: 1,
+    push: { kind: 'none' },
+  }));
+  c.close();
+  if (reply.type === 'ok') return 'ok';
+  return reply.type === 'error' ? reply.code : reply.type;
+}
+
+async function healthApnsState(server: DevServer): Promise<string> {
+  const res = await fetch(`${server.httpUrl}/health`);
+  const body = (await res.json()) as { ok: boolean; apns?: string };
+  return body.apns ?? 'missing';
+}
+
 async function main(): Promise<void> {
   console.log('booting wrangler dev for the smoke test');
-  const server = await startDevServer(8800, { TURN_TEST: '1' });
+  // APNS_KEY_ID alone is a deliberately partial push config; /health must surface it.
+  const server = await startDevServer(8800, { TURN_TEST: '1', APNS_KEY_ID: 'partial-test' });
 
   try {
     const aliceAuth = makeAuthKeys();
@@ -257,6 +284,27 @@ async function main(): Promise<void> {
     check(unauthTurn.type === 'error' && unauthTurn.code === 'UNAUTHENTICATED', 'turn credentials require auth');
     dave.close();
 
+    // A partial APNs secret set is surfaced on /health instead of failing silently.
+    check((await healthApnsState(server)) === 'partial', 'health reports a partial apns config');
+
+    // Per handle socket cap: unauthenticated sockets cannot pile up beyond the limit.
+    const pile: WebSocket[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      const s = new WebSocket(`${server.wsUrl}/?handle=pileup`);
+      await new Promise<void>((resolve, reject) => {
+        s.on('open', () => resolve());
+        s.on('error', reject);
+      });
+      pile.push(s);
+    }
+    const ninth = new WebSocket(`${server.wsUrl}/?handle=pileup`);
+    const capped = await new Promise<boolean>((resolve) => {
+      ninth.on('error', () => resolve(true));
+      ninth.on('open', () => resolve(false));
+    });
+    check(capped, 'ninth socket to one handle is rejected at upgrade');
+    for (const s of pile) s.close();
+
     // Version mismatch is rejected.
     const stranger = new WebSocket(`${server.wsUrl}/?handle=stranger`);
     await new Promise<void>((resolve) => stranger.on('open', () => resolve()));
@@ -283,6 +331,16 @@ async function main(): Promise<void> {
     const unavailable = await erin.turnCredentials();
     check(unavailable.type === 'error' && unavailable.code === 'CALLS_UNAVAILABLE', 'relay without turn answers CALLS_UNAVAILABLE');
     erin.close();
+
+    // No APNs vars at all reads as off, not partial.
+    check((await healthApnsState(bare)) === 'off', 'health reports apns off without any push config');
+
+    // New handle creation is throttled per client IP (REG_LIMIT, 20 per minute; erin
+    // already used one). Run last: the shared local key stays exhausted afterwards.
+    const outcomes: string[] = [];
+    for (let i = 0; i < 21; i += 1) outcomes.push(await registerOutcome(bare, `flood-${i}`));
+    check(outcomes[0] === 'ok', 'registration throttle admits early registrations');
+    check(outcomes.includes('RATE_LIMITED'), 'registration burst hits RATE_LIMITED');
   } finally {
     bare.stop();
   }

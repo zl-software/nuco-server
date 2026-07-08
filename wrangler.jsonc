@@ -23,12 +23,20 @@
     "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MailboxDO"] }],
+  // Per IP abuse limits (sliding window, per colo, nothing persisted beyond the window).
+  // The namespace ids are arbitrary developer chosen integers, nothing to provision.
+  // REG_LIMIT bounds new handle creation, CONN_LIMIT WebSocket upgrades.
+  "ratelimits": [
+    { "name": "REG_LIMIT", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
+    { "name": "CONN_LIMIT", "namespace_id": "1002", "simple": { "limit": 300, "period": 60 } }
+  ],
   "vars": {
     "QUEUE_MAX": "1000",
     "QUEUE_TTL_SECONDS": "2592000",
     "RATE_MAX_PER_MIN": "600",
     "MAX_MESSAGE_BYTES": "131072",
     "TURN_TTL_SECONDS": "7200",
+    "SOCKETS_MAX_PER_HANDLE": "8",
     "APNS_HOST": "api.push.apple.com"
   },
   "observability": { "enabled": true },
@@ -39,16 +47,22 @@
       "name": "nuco-server",
       "workers_dev": false,
       "routes": [{ "pattern": "nuco-server.zlsoftware.at", "custom_domain": true }],
-      // Bindings and vars are not inherited into envs; keep these in sync with the top level.
+      // Bindings and vars are not inherited into envs; keep these in sync with the top
+      // level (including ratelimits).
       "durable_objects": {
         "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
       },
+      "ratelimits": [
+        { "name": "REG_LIMIT", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
+        { "name": "CONN_LIMIT", "namespace_id": "1002", "simple": { "limit": 300, "period": 60 } }
+      ],
       "vars": {
         "QUEUE_MAX": "1000",
         "QUEUE_TTL_SECONDS": "2592000",
         "RATE_MAX_PER_MIN": "600",
         "MAX_MESSAGE_BYTES": "131072",
         "TURN_TTL_SECONDS": "7200",
+        "SOCKETS_MAX_PER_HANDLE": "8",
         "APNS_HOST": "api.push.apple.com"
       },
       "observability": { "enabled": true }

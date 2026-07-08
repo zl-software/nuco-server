@@ -138,17 +138,25 @@ again before every send.
 
 Vars (in `wrangler.jsonc`): `QUEUE_MAX` (1000), `QUEUE_TTL_SECONDS` (30 days),
 `RATE_MAX_PER_MIN` (600, per handle), `MAX_MESSAGE_BYTES` (131072), `TURN_TTL_SECONDS`
-(7200), `APNS_HOST`. Secrets (via `wrangler secret put`): `TURN_KEY_ID`,
-`TURN_KEY_SECRET`, `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`. The `DEV`
-and `TURN_TEST` vars exist only for `wrangler dev` and the tests; never set them on a
-deployment.
+(7200), `SOCKETS_MAX_PER_HANDLE` (8), `APNS_HOST`. Secrets (via `wrangler secret put`):
+`TURN_KEY_ID`, `TURN_KEY_SECRET`, `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`,
+`APNS_BUNDLE_ID`. APNs secrets are all four or none: a partial set is reported as
+`"apns": "partial"` on `/health` and pushes are skipped. The `DEV` and `TURN_TEST` vars
+exist only for `wrangler dev` and the tests; never set them on a deployment.
+
+Per IP abuse limits live in the `ratelimits` bindings in `wrangler.jsonc`: `REG_LIMIT`
+(new handle registrations per IP per minute, default 20) and `CONN_LIMIT` (WebSocket
+upgrades per IP per minute, default 300). Keys are hashed IPs, windows are sliding and
+per colo, nothing is persisted. Both are optional: a config without them fails open. On
+a custom domain you can add a zone level WAF rate limiting rule as a coarser outer wall.
 
 ## Security notes
 
 - The relay logs operational events only, never ciphertext, credentials, or full who to
   whom maps. TURN credentials and the TURN key are never logged.
-- Rate limiting is a per handle token bucket inside each mailbox object; Cloudflare's own
-  DDoS and WAF layers sit in front of it.
+- Rate limiting is layered: a per handle token bucket inside each mailbox object for the
+  authenticated owner, per IP limits on new handle creation and socket upgrades, a per
+  handle socket cap, and Cloudflare's own DDoS and WAF layers in front of it all.
 - Message queues live per handle in that handle's Durable Object (SQLite), capped by
   `QUEUE_MAX` and swept by a per object alarm after `QUEUE_TTL_SECONDS`.
 - Delivery stays at least once: rows are deleted only on client ack and are redelivered

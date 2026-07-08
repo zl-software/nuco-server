@@ -5,12 +5,18 @@ import type { MailboxDO } from './mailbox';
 
 export interface Env {
   MAILBOX: DurableObjectNamespace<MailboxDO>;
+  // Rate limiting bindings (optional so a trimmed self host config still runs; every use
+  // fails open when absent). REG_LIMIT gates new handle creation, CONN_LIMIT WebSocket
+  // upgrades, both keyed per client IP (hashed, see ipRateKey).
+  REG_LIMIT?: RateLimit;
+  CONN_LIMIT?: RateLimit;
   // Vars
   QUEUE_MAX?: string;
   QUEUE_TTL_SECONDS?: string;
   RATE_MAX_PER_MIN?: string;
   MAX_MESSAGE_BYTES?: string;
   TURN_TTL_SECONDS?: string;
+  SOCKETS_MAX_PER_HANDLE?: string;
   APNS_HOST?: string;
   // Dev only (wrangler dev --var): DEV enables debug endpoints and mocks push sending;
   // TURN_TEST makes turnCredentials return canned credentials so tests cover the frame
@@ -34,4 +40,24 @@ export function intVar(v: string | undefined, fallback: number): number {
 
 export function isDev(env: Env): boolean {
   return env.DEV === '1';
+}
+
+// Rate limit keys are a truncated SHA-256 of the client IP, never the raw IP. The binding
+// keeps per key counters for at most its 60 second window, per colo; the relay itself
+// stores nothing.
+export async function ipRateKey(ip: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip));
+  return [...new Uint8Array(digest.slice(0, 16))].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export type ApnsConfigState = 'off' | 'ok' | 'partial';
+
+// The operator contract is all four APNs secrets or none. A partial set is a
+// misconfiguration that would otherwise fail as a silent no-op push.
+export function apnsConfigState(env: Env): ApnsConfigState {
+  const set = [env.APNS_KEY, env.APNS_KEY_ID, env.APNS_TEAM_ID, env.APNS_BUNDLE_ID].filter(
+    (v) => v !== undefined && v !== '',
+  ).length;
+  if (set === 0) return 'off';
+  return set === 4 ? 'ok' : 'partial';
 }
