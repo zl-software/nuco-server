@@ -23,8 +23,9 @@ import {
   type ServerMessage,
 } from '@nuco/protocol';
 
-import { intVar, ipRateKey, isDev, type Env } from './env';
+import { attestRequired, intVar, ipRateKey, isDev, type Env } from './env';
 import { makeChallenge, verifyAuthSignature } from './auth';
+import { verifyAppAttestation } from './attest/verify';
 import { issueTurnCredentials } from './turn';
 import { sendApnsWake } from './push/apns';
 import { sendUnifiedPushWake } from './push/unifiedpush';
@@ -210,6 +211,16 @@ export class MailboxDO extends DurableObject<Env> {
           this.fail(ws, ErrorCode.RateLimited, msg.rid);
           ws.close(1013, 'try later');
           return;
+        }
+        // Registration gating (relay policy): when enforcement is on, creating a new
+        // handle demands a valid attestation bound to this socket's challenge. Updates
+        // are already gated by authentication above.
+        if (!existing && attestRequired(this.env)) {
+          const gateError = await this.checkRegisterAttestation(session, msg.attestation);
+          if (gateError !== null) {
+            this.fail(ws, gateError, msg.rid);
+            return;
+          }
         }
         if (msg.push.kind === 'unifiedpush' && (!msg.push.endpoint || !isSyntacticallyPublicHttpsUrl(msg.push.endpoint))) {
           this.fail(ws, ErrorCode.MalformedMessage, msg.rid);
@@ -451,6 +462,36 @@ export class MailboxDO extends DurableObject<Env> {
       // Push is fire and forget: the message is queued either way.
       console.error('[push] wake failed', err instanceof Error ? err.message : 'unknown');
     }
+  }
+
+  // Returns null when registration may proceed, else the error code to send. The
+  // attestation is verified offline against the pinned Apple root and then discarded:
+  // nothing about it is stored or logged beyond a short machine readable reason.
+  private async checkRegisterAttestation(
+    session: SessionState,
+    attestation: { kind: string; keyId: string; data: string } | undefined,
+  ): Promise<ErrorCode | null> {
+    if (!attestation || attestation.kind !== 'apple-app-attest') {
+      return ErrorCode.AttestationRequired;
+    }
+    if (!this.env.ATTEST_APP_ID) {
+      // Fail closed: enforcement without an app id is a misconfiguration, not an open door.
+      console.error('[attest] ATTEST_REQUIRED is set but ATTEST_APP_ID is missing');
+      return ErrorCode.AttestationFailed;
+    }
+    if (!session.challenge) return ErrorCode.AttestationFailed;
+    const result = await verifyAppAttestation({
+      keyIdB64: attestation.keyId,
+      attestationB64: attestation.data,
+      challenge: session.challenge,
+      appId: this.env.ATTEST_APP_ID,
+      acceptSandbox: this.env.ATTEST_ACCEPT_SANDBOX === '1',
+    });
+    if (!result.ok) {
+      console.error('[attest] registration attestation rejected:', result.reason);
+      return ErrorCode.AttestationFailed;
+    }
+    return null;
   }
 
   private async registerAllowed(session: SessionState): Promise<boolean> {

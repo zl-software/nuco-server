@@ -345,6 +345,47 @@ async function main(): Promise<void> {
     bare.stop();
   }
 
+  // With attestation enforcement on, creating a new handle demands a valid App Attest
+  // attestation; a plain register is asked to retry with one, garbage fails verification.
+  // The verifier itself is covered by test/attest-verify.ts; this proves the wire gate.
+  console.log('booting a third instance with attestation enforcement');
+  const gated = await startDevServer(8804, { ATTEST_REQUIRED: '1', ATTEST_APP_ID: 'TEAM00TEST.com.zlsoftware.nuco' });
+  try {
+    check((await registerOutcome(gated, 'plain')) === 'ATTESTATION_REQUIRED', 'plain register is asked for an attestation');
+
+    const auth = makeAuthKeys();
+    const c = await Client.connect(gated, 'forger', auth);
+    const connected = c.once((m) => m.type === 'connected');
+    c.send({ type: 'connect', protocolVersion: PROTOCOL_VERSION, handle: 'forger' });
+    await connected;
+    const forged = await c.request((rid) => ({
+      type: 'register',
+      rid,
+      authKey: auth.publicB64,
+      deviceId: 1,
+      push: { kind: 'none' },
+      attestation: {
+        kind: 'apple-app-attest',
+        keyId: Buffer.alloc(32, 7).toString('base64'),
+        data: Buffer.from('ffffff', 'hex').toString('base64'),
+      },
+    }));
+    check(forged.type === 'error' && forged.code === 'ATTESTATION_FAILED', 'forged attestation fails verification');
+
+    const unknownKind = await c.request((rid) => ({
+      type: 'register',
+      rid,
+      authKey: auth.publicB64,
+      deviceId: 1,
+      push: { kind: 'none' },
+      attestation: { kind: 'play-integrity', keyId: 'AAAA', data: 'AAAA' },
+    }));
+    check(unknownKind.type === 'error' && unknownKind.code === 'ATTESTATION_REQUIRED', 'unknown attestation kind is asked to retry');
+    c.close();
+  } finally {
+    gated.stop();
+  }
+
   if (failures > 0) {
     console.error(`\nws smoke test FAILED with ${failures} failure(s)`);
     process.exit(1);

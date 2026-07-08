@@ -19,11 +19,14 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx test/ws-smoke.ts",
+    "test:attest": "tsx test/attest-verify.ts",
     "test:e2e": "tsx test/e2e.ts"
   },
   "dependencies": {
     "@nuco/protocol": "file:../protocol",
-    "jose": "^6.2.0"
+    "@peculiar/x509": "^2.0.0",
+    "jose": "^6.2.0",
+    "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250101.0",

@@ -18,6 +18,14 @@ export interface Env {
   TURN_TTL_SECONDS?: string;
   SOCKETS_MAX_PER_HANDLE?: string;
   APNS_HOST?: string;
+  // App Attest registration gating (relay policy, see PROTOCOL.md "App attestation").
+  // ATTEST_REQUIRED=1 makes new handle creation demand a valid Apple App Attest
+  // attestation for ATTEST_APP_ID (TEAMID.bundleid). Off by default: self hosted relays
+  // and the local dev and test setups register plain. ATTEST_ACCEPT_SANDBOX=1 also
+  // accepts development environment attestations (never set it on production).
+  ATTEST_REQUIRED?: string;
+  ATTEST_APP_ID?: string;
+  ATTEST_ACCEPT_SANDBOX?: string;
   // Dev only (wrangler dev --var): DEV enables debug endpoints and mocks push sending;
   // TURN_TEST makes turnCredentials return canned credentials so tests cover the frame
   // path without a real TURN key.
@@ -40,6 +48,10 @@ export function intVar(v: string | undefined, fallback: number): number {
 
 export function isDev(env: Env): boolean {
   return env.DEV === '1';
+}
+
+export function attestRequired(env: Env): boolean {
+  return env.ATTEST_REQUIRED === '1';
 }
 
 // Rate limit keys are a truncated SHA-256 of the client IP, never the raw IP. The binding
