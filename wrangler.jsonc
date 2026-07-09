@@ -63,7 +63,7 @@
         "MAX_MESSAGE_BYTES": "131072",
         "TURN_TTL_SECONDS": "7200",
         "SOCKETS_MAX_PER_HANDLE": "8",
-        "APNS_HOST": "api.push.apple.com"
+        "APNS_HOST": "api.push.apple.com",
         // Registration gating (live since the TestFlight pass): the reference relay only
         // accepts new handles from attested installs of the official app (the team id is
         // public information). These two stay production only; self hosters and dev never
