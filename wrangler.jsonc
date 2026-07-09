@@ -64,11 +64,12 @@
         "TURN_TTL_SECONDS": "7200",
         "SOCKETS_MAX_PER_HANDLE": "8",
         "APNS_HOST": "api.push.apple.com"
-        // Launch flip: uncomment both to make the reference relay accept new handles only
-        // from attested installs of the official app (the team id is public information).
-        // These two stay production only; self hosters and dev never set them.
-        // "ATTEST_REQUIRED": "1",
-        // "ATTEST_APP_ID": "W9NZPSPK32.com.zlsoftware.nuco"
+        // Registration gating (live since the TestFlight pass): the reference relay only
+        // accepts new handles from attested installs of the official app (the team id is
+        // public information). These two stay production only; self hosters and dev never
+        // set them.
+        "ATTEST_REQUIRED": "1",
+        "ATTEST_APP_ID": "W9NZPSPK32.com.zlsoftware.nuco"
       },
       "observability": { "enabled": true }
     }
