@@ -4,7 +4,8 @@
 //   register (no key material) -> exchange contact cards out of band (the QR) ->
 //   deterministic initiator runs X3DH offline -> verify/confirm exchange with the card
 //   hash proof in both directions -> sealed text both ways -> call signaling -> the
-//   screenshot protection request/accept/cancel trio.
+//   screenshot protection request/accept/cancel trio -> reply references and message
+//   deletion -> the profile/name rename announcement.
 // Also asserts the relay only ever holds ciphertext, that an offline recipient triggers a
 // content free push wake, and that a prekey envelope held unacked (the unknown sender
 // rule) survives at the relay and redelivers after a reconnect, exactly what the app does
@@ -314,6 +315,17 @@ async function main(): Promise<void> {
     'responder received the delete request for the same id',
   );
   check(!utf8Decode(Buffer.from(deleteWire, 'base64')).includes('message/delete'), 'the delete request is opaque on the wire');
+
+  // A display name change (protocol 2.6) rides the same sealed channel: the receiver gets
+  // the new name to apply to its stored contact, and the relay sees only ciphertext.
+  const renameWire = await sendSealed(initiator, responder.handle, { t: 'profile/name', name: 'Alice Renamed' });
+  await waitFor(() => responder.received.length >= 10);
+  const rename = responder.received[9];
+  check(
+    rename?.content.t === 'profile/name' && rename.content.name === 'Alice Renamed',
+    'responder received the display name change',
+  );
+  check(!utf8Decode(Buffer.from(renameWire, 'base64')).includes('Alice Renamed'), 'the new name is opaque on the wire');
 
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
