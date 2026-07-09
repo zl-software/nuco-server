@@ -162,6 +162,9 @@ a custom domain you can add a zone level WAF rate limiting rule as a coarser out
   `QUEUE_MAX` and swept by a per object alarm after `QUEUE_TTL_SECONDS`.
 - Delivery stays at least once: rows are deleted only on client ack and are redelivered
   on every reconnect until then.
+- The official iOS app certificate pins the reference relay's edge certificate
+  authorities. Self hosted relays are not pinned: the app trusts the device's system
+  certificate store for them, exactly like a browser would.
 
 ## License
 
