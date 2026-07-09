@@ -19,7 +19,7 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx test/ws-smoke.ts",
-    "test:attest": "tsx test/attest-verify.ts",
+    "test:attest": "tsx test/attest-verify.ts && tsx test/attest-client.ts",
     "test:e2e": "tsx test/e2e.ts"
   },
   "dependencies": {
