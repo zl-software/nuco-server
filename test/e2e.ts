@@ -1,8 +1,8 @@
 // End to end harness: headless clients that share the app's real crypto and transport
-// code run the full protocol 2.0 flow against the Workers relay (real workerd via
+// code run the full protocol 3.0 flow against the Workers relay (real workerd via
 // wrangler dev), proving the contract without two phones.
 //   register (no key material) -> exchange contact cards out of band (the QR) ->
-//   deterministic initiator runs X3DH offline -> verify/confirm exchange with the card
+//   deterministic initiator runs PQXDH offline -> verify/confirm exchange with the card
 //   hash proof in both directions -> sealed text both ways -> call signaling -> the
 //   screenshot protection request/accept/cancel trio -> reply references and message
 //   deletion -> the profile/name rename announcement.
@@ -28,15 +28,21 @@ import {
 
 import { startDevServer, debugState } from './dev-server';
 
-// Shared app code (pure, no React Native imports).
+// Shared app code (pure, no React Native imports). The libsignal backend is the official
+// Node binding, the same Rust core the device builds wrap.
 import {
   generateIdentity,
   generateSignedPreKey,
+  generateKyberPreKey,
   installIdentity,
   toSignedPreKeyPublic,
+  toKyberPreKeyPublic,
   identityPublicKeyBase64,
   authPublicKeyBase64,
+  SIGNED_PREKEY_ID,
+  KYBER_PREKEY_ID,
 } from '../../nuco-messenger/src/crypto/identity';
+import { NodeLibsignalBackend } from '../../nuco-messenger/src/crypto/backend-node';
 import { NucoSignal, type SessionBootstrap } from '../../nuco-messenger/src/crypto/signal';
 import { computeCardHash, isSessionInitiator } from '../../nuco-messenger/src/crypto/verification';
 import { NucoSignalStore, InMemoryKvBackend } from '../../nuco-messenger/src/crypto/store';
@@ -77,10 +83,12 @@ interface HeadlessClient {
 
 async function makeClient(port: number, handle: string, scanned = true): Promise<HeadlessClient> {
   const store = new NucoSignalStore(new InMemoryKvBackend());
-  const id = await generateIdentity();
-  const signedPreKey = await generateSignedPreKey(id.identityKeyPair, 1);
-  await installIdentity(store, id, signedPreKey);
-  const signal = new NucoSignal(store);
+  const backend = new NodeLibsignalBackend();
+  const id = await generateIdentity(backend);
+  const signedPreKey = await generateSignedPreKey(backend, id.identityKeyPair.privateKey, SIGNED_PREKEY_ID);
+  const kyberPreKey = await generateKyberPreKey(backend, id.identityKeyPair.privateKey, KYBER_PREKEY_ID);
+  await installIdentity(store, id, signedPreKey, kyberPreKey, handle);
+  const signal = new NucoSignal(store, backend);
 
   const me: HeadlessClient = {
     handle,
@@ -93,6 +101,7 @@ async function makeClient(port: number, handle: string, scanned = true): Promise
       identityKey: identityPublicKeyBase64(id),
       registrationId: id.registrationId,
       signedPreKey: toSignedPreKeyPublic(signedPreKey),
+      kyberPreKey: toKyberPreKeyPublic(kyberPreKey),
     },
     scanned,
     heldPrekey: 0,
@@ -330,11 +339,11 @@ async function main(): Promise<void> {
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
 
-  // The app transport must fetch TURN credentials from a 2.x relay: the frame exists in
+  // The app transport must fetch TURN credentials from the relay: the frame exists in
   // every 2.x, and the client gate may only refuse a 1.x relay below minor 3 (gating on
   // the minor alone broke when the 2.0 bump reset it to 0).
   const turn = await alice.client.turnCredentials();
-  check(turn.urls.length > 0 && turn.credential.length > 0, 'client fetched turn credentials from a 2.x relay');
+  check(turn.urls.length > 0 && turn.credential.length > 0, 'client fetched turn credentials from the relay');
 
   // The unknown sender rule: dave scanned erin, but erin has not scanned dave back. Dave's
   // confirm (a prekey envelope) arrives at erin, who holds it UNACKED. It must survive at
