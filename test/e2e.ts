@@ -389,6 +389,25 @@ async function main(): Promise<void> {
   });
   check(carolWakes === 1, 'offline recipient triggered a content free push wake');
 
+  // Wake hints (3.1): invisible control traffic ('none') queues without any wake, while
+  // a call offer ('voip') wakes. The relay counts both wake classes in dev.
+  await bob.client.sendEnvelope(
+    'carol',
+    { id: randomUUID(), ciphertext: Buffer.from('y').toString('base64'), messageType: 'whisper', sentAt: Date.now() },
+    'none',
+  );
+  await bob.client.sendEnvelope(
+    'carol',
+    { id: randomUUID(), ciphertext: Buffer.from('z').toString('base64'), messageType: 'whisper', sentAt: Date.now() },
+    'voip',
+  );
+  let carolWakesAfter = 0;
+  await waitFor(() => {
+    void debugState(server, 'carol').then((s) => (carolWakesAfter = s.wakes));
+    return carolWakesAfter >= 2;
+  });
+  check(carolWakesAfter === 2, "a 'none' send queued silently and a 'voip' send woke");
+
   alice.client.stop();
   bob.client.stop();
   dave.client.stop();
