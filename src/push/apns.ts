@@ -78,3 +78,44 @@ export async function sendApnsWake(env: Env, deviceToken: string, apnsTopic: str
   }
   return { sent: res.ok, unregistered: res.status === 410 };
 }
+
+// A VoIP wake (PushKit): an incoming call for a device with no live socket. The payload
+// is empty on purpose; iOS requires the app to report the push as an incoming call, and
+// everything about the call stays inside the sealed envelope the app fetches on wake.
+// The short expiry matches the ring window: a call wake delivered later than the caller
+// keeps ringing would only produce a phantom call screen.
+const VOIP_EXPIRY_SECONDS = 45;
+
+export async function sendApnsVoipWake(env: Env, voipToken: string, apnsTopic: string | undefined): Promise<ApnsResult> {
+  const state = apnsConfigState(env);
+  if (state !== 'ok') {
+    if (state === 'partial' && !warnedPartial) {
+      warnedPartial = true;
+      console.error('[push] apns config incomplete: set all of APNS_KEY, APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID, or none');
+    }
+    return { sent: false, unregistered: false };
+  }
+  const jwt = await providerJwt(env);
+  const host = env.APNS_HOST && env.APNS_HOST !== '' ? env.APNS_HOST : 'api.push.apple.com';
+  const topic = `${apnsTopic ?? env.APNS_BUNDLE_ID ?? ''}.voip`;
+  const res = await fetch(`https://${host}/3/device/${voipToken}`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${jwt}`,
+      'apns-topic': topic,
+      'apns-push-type': 'voip',
+      'apns-priority': '10',
+      'apns-expiration': String(Math.floor(Date.now() / 1000) + VOIP_EXPIRY_SECONDS),
+    },
+    body: JSON.stringify({ aps: {} }),
+  });
+  if (!res.ok && res.status !== 410) {
+    const reason = await res
+      .json()
+      .then((b) => (b as { reason?: string }).reason ?? 'unknown')
+      .catch(() => 'unknown');
+    console.error('[push] apns voip rejected', res.status, reason);
+    if (res.status === 403) cachedJwt = null;
+  }
+  return { sent: res.ok, unregistered: res.status === 410 };
+}

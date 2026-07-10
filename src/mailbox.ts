@@ -22,6 +22,7 @@ import {
   type ClientMessage,
   type MessageEnvelope,
   type PushRegistration,
+  type WakeHint,
   type ServerMessage,
 } from '@nuco/protocol';
 
@@ -29,7 +30,7 @@ import { attestRequired, intVar, ipRateKey, isDev, type Env } from './env';
 import { makeChallenge, verifyAuthSignature } from './auth';
 import { verifyAppAttestation } from './attest/verify';
 import { issueTurnCredentials } from './turn';
-import { sendApnsWake } from './push/apns';
+import { sendApnsWake, sendApnsVoipWake } from './push/apns';
 import { sendUnifiedPushWake } from './push/unifiedpush';
 import { isSyntacticallyPublicHttpsUrl } from './push/url-guard';
 
@@ -56,6 +57,7 @@ type DeviceRow = {
   push_token: string | null;
   push_endpoint: string | null;
   apns_topic: string | null;
+  voip_token: string | null;
   created_at: number;
   last_seen: number;
 };
@@ -88,6 +90,7 @@ export class MailboxDO extends DurableObject<Env> {
         push_token TEXT,
         push_endpoint TEXT,
         apns_topic TEXT,
+        voip_token TEXT,
         created_at INTEGER NOT NULL,
         last_seen INTEGER NOT NULL
       );
@@ -101,6 +104,12 @@ export class MailboxDO extends DurableObject<Env> {
         enqueued_at INTEGER NOT NULL
       );
     `);
+    // Mailboxes created before protocol 3.1 lack the voip token column.
+    try {
+      this.ctx.storage.sql.exec('ALTER TABLE device ADD COLUMN voip_token TEXT');
+    } catch {
+      // Column already exists.
+    }
   }
 
   // --- socket lifecycle ---
@@ -270,7 +279,7 @@ export class MailboxDO extends DurableObject<Env> {
           return;
         }
         const stub = this.env.MAILBOX.get(this.env.MAILBOX.idFromName(msg.to));
-        const result = await stub.deliver(session.handle, msg.envelope);
+        const result = await stub.deliver(session.handle, msg.envelope, msg.wake);
         if (!result.ok) {
           this.fail(ws, result.reason === 'no-such-handle' ? ErrorCode.NoSuchHandle : ErrorCode.QueueFull, msg.rid);
           return;
@@ -329,8 +338,9 @@ export class MailboxDO extends DurableObject<Env> {
   // --- RPC surface (called by other mailboxes and the worker) ---
 
   // The sending side calls the RECIPIENT's mailbox. Enqueue first (delivery stays queue
-  // backed and at least once), then push to a live socket or trigger a content free wake.
-  async deliver(from: string, envelope: MessageEnvelope): Promise<DeliverResult> {
+  // backed and at least once), then push to a live socket or trigger a wake per the
+  // sender's hint (since 3.1): 'alert' banners, 'voip' rings, 'none' queues silently.
+  async deliver(from: string, envelope: MessageEnvelope, wakeHint?: WakeHint): Promise<DeliverResult> {
     const device = this.getDevice();
     if (!device) return { ok: false, reason: 'no-such-handle' };
 
@@ -372,7 +382,8 @@ export class MailboxDO extends DurableObject<Env> {
         delivered = true;
       }
     }
-    if (!delivered) await this.wake(device);
+    const hint = wakeHint ?? 'alert';
+    if (!delivered && hint !== 'none') await this.wake(device, hint);
     return { ok: true, seq, delivered };
   }
 
@@ -408,14 +419,15 @@ export class MailboxDO extends DurableObject<Env> {
   private registerDevice(authKey: string, deviceId: number, push: PushRegistration, createdAt: number | undefined): void {
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO device (id, auth_key, device_id, push_kind, push_token, push_endpoint, apns_topic, created_at, last_seen)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO device (id, auth_key, device_id, push_kind, push_token, push_endpoint, apns_topic, voip_token, created_at, last_seen)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       authKey,
       deviceId,
       push.kind,
       push.token ?? null,
       push.endpoint ?? null,
       push.apnsTopic ?? null,
+      push.voipToken ?? null,
       createdAt ?? now,
       now,
     );
@@ -441,15 +453,24 @@ export class MailboxDO extends DurableObject<Env> {
     }
   }
 
-  private async wake(device: DeviceRow): Promise<void> {
+  private async wake(device: DeviceRow, hint: 'alert' | 'voip'): Promise<void> {
     try {
       if (isDev(this.env)) {
         // Dev mode: record instead of sending (also, wrangler dev cannot reach APNs over
         // HTTP/2). The counter feeds the /debug endpoint the tests read.
         const wakes = ((this.ctx.storage.kv.get('wakes') as number | undefined) ?? 0) + 1;
         this.ctx.storage.kv.put('wakes', wakes);
-        console.log(`[push:mock] content free wake via ${device.push_kind}`);
+        console.log(`[push:mock] content free ${hint} wake via ${device.push_kind}`);
         return;
+      }
+      if (device.push_kind === 'apns' && hint === 'voip' && device.voip_token) {
+        // An incoming call: PushKit wake with a ring window expiry. A dead voip token
+        // falls back to the visible banner below so the call is not silently lost.
+        const result = await sendApnsVoipWake(this.env, device.voip_token, device.apns_topic ?? undefined);
+        if (result.sent) return;
+        if (result.unregistered) {
+          this.ctx.storage.sql.exec('UPDATE device SET voip_token = NULL WHERE id = 1');
+        }
       }
       if (device.push_kind === 'apns' && device.push_token) {
         const result = await sendApnsWake(this.env, device.push_token, device.apns_topic ?? undefined);
