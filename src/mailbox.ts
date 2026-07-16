@@ -216,6 +216,13 @@ export class MailboxDO extends DurableObject<Env> {
           this.fail(ws, ErrorCode.Unauthenticated, msg.rid);
           return;
         }
+        // Re-creating a banned handle would mint a fresh auth key and defeat the ban.
+        // Checked after the auth gate above so probing an existing handle still answers
+        // UNAUTHENTICATED, not ban status.
+        if (this.isBanned()) {
+          this.fail(ws, ErrorCode.Banned, msg.rid);
+          return;
+        }
         // New handle creation is throttled per client IP; authenticated updates (push
         // token refresh) never touch the limiter.
         if (!existing && !(await this.registerAllowed(session))) {
@@ -255,6 +262,13 @@ export class MailboxDO extends DurableObject<Env> {
         }
         if (!(await verifyAuthSignature(device.auth_key, session.challenge, msg.signature))) {
           this.fail(ws, ErrorCode.AuthFailed);
+          return;
+        }
+        // Only the proven owner ever learns about a ban: anyone else fails AUTH_FAILED
+        // above first, so ban status is not a pre auth oracle.
+        if (this.isBanned()) {
+          this.fail(ws, ErrorCode.Banned);
+          ws.close(1008, 'banned');
           return;
         }
         session.authenticated = true;
@@ -332,6 +346,33 @@ export class MailboxDO extends DurableObject<Env> {
         });
         return;
       }
+
+      case 'report': {
+        if (!this.requireAuth(ws, session, msg.rid)) return;
+        // Self reports are meaningless; anything else is the operator's call to judge.
+        if (msg.handle === session.handle) {
+          this.fail(ws, ErrorCode.ReportRejected, msg.rid);
+          return;
+        }
+        if (!(await this.reportAllowed(session))) {
+          this.fail(ws, ErrorCode.RateLimited, msg.rid);
+          return;
+        }
+        const stub = this.env.REPORTS.get(this.env.REPORTS.idFromName('reports'));
+        const result = await stub.add({
+          reporter: session.handle,
+          reported: msg.handle,
+          category: msg.category,
+          comment: msg.comment,
+          context: msg.context,
+        });
+        if (!result.ok) {
+          this.fail(ws, ErrorCode.ReportRejected, msg.rid);
+          return;
+        }
+        this.send(ws, { type: 'ok', rid: msg.rid });
+        return;
+      }
     }
   }
 
@@ -342,7 +383,8 @@ export class MailboxDO extends DurableObject<Env> {
   // sender's hint (since 3.1): 'alert' banners, 'voip' rings, 'none' queues silently.
   async deliver(from: string, envelope: MessageEnvelope, wakeHint?: WakeHint): Promise<DeliverResult> {
     const device = this.getDevice();
-    if (!device) return { ok: false, reason: 'no-such-handle' };
+    // A banned recipient answers exactly like a deleted one, indistinguishable by design.
+    if (!device || this.isBanned()) return { ok: false, reason: 'no-such-handle' };
 
     const existing = this.ctx.storage.sql
       .exec<{ seq: number }>('SELECT seq FROM inbox WHERE id = ?', envelope.id)
@@ -390,6 +432,22 @@ export class MailboxDO extends DurableObject<Env> {
   // Dev only debug surface (gated in the worker).
   async debugState(): Promise<{ queueDepth: number; wakes: number }> {
     return { queueDepth: this.queueDepth(), wakes: (this.ctx.storage.kv.get('wakes') as number | undefined) ?? 0 };
+  }
+
+  // Operator ban (called from the admin surface, see src/admin.ts). Banning drops the
+  // queue and every live socket; the device record stays so the handle can neither be
+  // re-registered nor squatted while banned. Unban just clears the flag.
+  async setBanned(banned: boolean): Promise<void> {
+    if (!banned) {
+      this.ctx.storage.kv.delete('banned');
+      return;
+    }
+    this.ctx.storage.kv.put('banned', 1);
+    this.ctx.storage.sql.exec('DELETE FROM inbox');
+    for (const ws of this.ctx.getWebSockets()) {
+      this.send(ws, { type: 'error', code: ErrorCode.Banned });
+      ws.close(1008, 'banned');
+    }
   }
 
   // --- queue maintenance ---
@@ -525,6 +583,20 @@ export class MailboxDO extends DurableObject<Env> {
       // Fail open: the binding is optional for self hosters and must never block onboarding.
       return true;
     }
+  }
+
+  private async reportAllowed(session: SessionState): Promise<boolean> {
+    try {
+      const outcome = await this.env.REPORT_LIMIT?.limit({ key: session.ipKey || 'unknown' });
+      return outcome ? outcome.success : true;
+    } catch {
+      // Fail open, like every rate limit binding.
+      return true;
+    }
+  }
+
+  private isBanned(): boolean {
+    return this.ctx.storage.kv.get('banned') !== undefined;
   }
 
   private requireAuth(ws: WebSocket, session: SessionState, rid?: string): boolean {

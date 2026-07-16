@@ -2,14 +2,19 @@
 // (wrangler vars); parse with defaults matching the documented values in wrangler.jsonc.
 
 import type { MailboxDO } from './mailbox';
+import type { ReportsDO } from './reports';
 
 export interface Env {
   MAILBOX: DurableObjectNamespace<MailboxDO>;
+  // The singleton abuse report store (idFromName('reports'), see src/reports.ts).
+  REPORTS: DurableObjectNamespace<ReportsDO>;
   // Rate limiting bindings (optional so a trimmed self host config still runs; every use
   // fails open when absent). REG_LIMIT gates new handle creation, CONN_LIMIT WebSocket
-  // upgrades, both keyed per client IP (hashed, see ipRateKey).
+  // upgrades, REPORT_LIMIT report submission, all keyed per client IP (hashed, see
+  // ipRateKey).
   REG_LIMIT?: RateLimit;
   CONN_LIMIT?: RateLimit;
+  REPORT_LIMIT?: RateLimit;
   // Vars
   QUEUE_MAX?: string;
   QUEUE_TTL_SECONDS?: string;
@@ -17,6 +22,7 @@ export interface Env {
   MAX_MESSAGE_BYTES?: string;
   TURN_TTL_SECONDS?: string;
   SOCKETS_MAX_PER_HANDLE?: string;
+  REPORTS_MAX?: string;
   APNS_HOST?: string;
   // App Attest registration gating (relay policy, see PROTOCOL.md "App attestation").
   // ATTEST_REQUIRED=1 makes new handle creation demand a valid Apple App Attest
@@ -32,6 +38,9 @@ export interface Env {
   DEV?: string;
   TURN_TEST?: string;
   // Secrets
+  // ADMIN_TOKEN mounts the operator endpoints under /admin (reports, ban, unban; see
+  // src/admin.ts). Without it the paths answer 404.
+  ADMIN_TOKEN?: string;
   TURN_KEY_ID?: string;
   TURN_KEY_SECRET?: string;
   APNS_KEY?: string;

@@ -12,7 +12,8 @@
 // Secrets (set with `wrangler secret put <NAME>`, per env: add `--env production` for the
 // reference deployment): TURN_KEY_ID, TURN_KEY_SECRET (voice calls via Cloudflare
 // Realtime TURN; omit both to run without calls), APNS_KEY (the .p8 PEM content),
-// APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (iOS push; omit to run without).
+// APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID (iOS push; omit to run without), ADMIN_TOKEN
+// (mounts the operator report and ban endpoints under /admin; omit to run without).
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "nuco-server",
@@ -20,15 +21,23 @@
   "compatibility_date": "2026-06-01",
   "workers_dev": true,
   "durable_objects": {
-    "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
+    "bindings": [
+      { "name": "MAILBOX", "class_name": "MailboxDO" },
+      { "name": "REPORTS", "class_name": "ReportsDO" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MailboxDO"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MailboxDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["ReportsDO"] }
+  ],
   // Per IP abuse limits (sliding window, per colo, nothing persisted beyond the window).
   // The namespace ids are arbitrary developer chosen integers, nothing to provision.
-  // REG_LIMIT bounds new handle creation, CONN_LIMIT WebSocket upgrades.
+  // REG_LIMIT bounds new handle creation, CONN_LIMIT WebSocket upgrades, REPORT_LIMIT
+  // abuse report submission.
   "ratelimits": [
     { "name": "REG_LIMIT", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
-    { "name": "CONN_LIMIT", "namespace_id": "1002", "simple": { "limit": 300, "period": 60 } }
+    { "name": "CONN_LIMIT", "namespace_id": "1002", "simple": { "limit": 300, "period": 60 } },
+    { "name": "REPORT_LIMIT", "namespace_id": "1003", "simple": { "limit": 5, "period": 60 } }
   ],
   "vars": {
     "QUEUE_MAX": "1000",
@@ -37,6 +46,7 @@
     "MAX_MESSAGE_BYTES": "131072",
     "TURN_TTL_SECONDS": "7200",
     "SOCKETS_MAX_PER_HANDLE": "8",
+    "REPORTS_MAX": "10000",
     "APNS_HOST": "api.push.apple.com"
   },
   "observability": { "enabled": true },
@@ -50,11 +60,15 @@
       // Bindings and vars are not inherited into envs; keep these in sync with the top
       // level (including ratelimits).
       "durable_objects": {
-        "bindings": [{ "name": "MAILBOX", "class_name": "MailboxDO" }]
+        "bindings": [
+          { "name": "MAILBOX", "class_name": "MailboxDO" },
+          { "name": "REPORTS", "class_name": "ReportsDO" }
+        ]
       },
       "ratelimits": [
         { "name": "REG_LIMIT", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
-        { "name": "CONN_LIMIT", "namespace_id": "1002", "simple": { "limit": 300, "period": 60 } }
+        { "name": "CONN_LIMIT", "namespace_id": "1002", "simple": { "limit": 300, "period": 60 } },
+        { "name": "REPORT_LIMIT", "namespace_id": "1003", "simple": { "limit": 5, "period": 60 } }
       ],
       "vars": {
         "QUEUE_MAX": "1000",
@@ -63,6 +77,7 @@
         "MAX_MESSAGE_BYTES": "131072",
         "TURN_TTL_SECONDS": "7200",
         "SOCKETS_MAX_PER_HANDLE": "8",
+        "REPORTS_MAX": "10000",
         "APNS_HOST": "api.push.apple.com",
         // Registration gating (live since the TestFlight pass): the reference relay only
         // accepts new handles from attested installs of the official app (the team id is

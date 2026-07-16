@@ -7,8 +7,10 @@ import { LIMITS } from '@nuco/protocol';
 
 import type { Env } from './env';
 import { apnsConfigState, ipRateKey, isDev } from './env';
+import { handleAdmin } from './admin';
 
 export { MailboxDO } from './mailbox';
+export { ReportsDO } from './reports';
 
 function isRoutableHandle(handle: string): boolean {
   return handle.length > 0 && handle.length <= LIMITS.handleMaxLen;
@@ -32,6 +34,11 @@ export default {
       // The apns state is off/ok/partial only, never a secret; it lets an operator see a
       // misconfigured push setup from the outside.
       return Response.json({ ok: true, apns: apnsConfigState(env) });
+    }
+
+    // Operator endpoints (reports, ban, unban). 404 unless ADMIN_TOKEN is set.
+    if (url.pathname.startsWith('/admin/')) {
+      return handleAdmin(request, env);
     }
 
     // Test support: expose a mailbox's queue depth and mock wake counter. Never mounted
