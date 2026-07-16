@@ -11,7 +11,8 @@
 // rule) survives at the relay and redelivers after a reconnect, exactly what the app does
 // when the confirm of a not yet reciprocated scan arrives early. Real WebRTC cannot run
 // in Node, so call checks use a fake SDP of realistic size and validate signaling,
-// freshness, and glare rules only.
+// freshness, and glare rules only. The 3.2 report and ban lifecycle runs against the
+// bearer authenticated admin surface (ADMIN_TOKEN is set for the run).
 //
 // Run: npx tsx test/e2e.ts
 
@@ -79,6 +80,8 @@ interface HeadlessClient {
   // prekey envelope is left unacked (held) so the relay keeps it queued for redelivery.
   scanned: boolean;
   heldPrekey: number;
+  // Uncorrelated error codes from the relay (BANNED, attestation verdicts).
+  errors: string[];
 }
 
 async function makeClient(port: number, handle: string, scanned = true): Promise<HeadlessClient> {
@@ -105,6 +108,7 @@ async function makeClient(port: number, handle: string, scanned = true): Promise
     },
     scanned,
     heldPrekey: 0,
+    errors: [],
   };
 
   me.client = new RelayClient({
@@ -118,6 +122,9 @@ async function makeClient(port: number, handle: string, scanned = true): Promise
       push: { kind: 'apns', token: `token-${handle}`, apnsTopic: 'com.zlsoftware.nuco' },
     },
     autoReconnect: false,
+    onError: (code) => {
+      me.errors.push(code);
+    },
     onDeliver: async (from, envelope) => {
       if (!me.scanned && envelope.messageType === 'prekey') {
         me.heldPrekey += 1;
@@ -160,7 +167,7 @@ async function main(): Promise<void> {
   console.log('booting wrangler dev for the end to end harness');
   // TURN_TEST gives the dev relay canned credentials, so the CLIENT side turnCredentials
   // path is coverable end to end (its version gate once tripped on the 2.0 minor reset).
-  const server = await startDevServer(8801, { TURN_TEST: '1' });
+  const server = await startDevServer(8801, { TURN_TEST: '1', ADMIN_TOKEN: 'e2e-admin-token' });
   const port = server.port;
   console.log(`nuco end to end harness against the workers relay on ${port}\n`);
 
@@ -408,10 +415,83 @@ async function main(): Promise<void> {
   });
   check(carolWakesAfter === 2, "a 'none' send queued silently and a 'voip' send woke");
 
+  // Reports and bans (3.2): a metadata only report round trips to the operator surface,
+  // a ban kicks the live socket with BANNED, hides the handle from senders, blocks
+  // re-authentication, and an unban restores the account.
+  const adminToken = 'e2e-admin-token';
+  const frank = await makeClient(port, 'frank');
+  const grace = await makeClient(port, 'grace');
+
+  await frank.client.report({ handle: 'grace', category: 'spam', comment: 'e2e report', context: 'contact' });
+  check(true, 'report frame accepted on an authenticated socket');
+
+  const selfReport = await frank.client.report({ handle: 'frank', category: 'spam' }).then(
+    () => null,
+    (e: Error) => e.message,
+  );
+  check(selfReport === 'REPORT_REJECTED', 'a self report is rejected');
+
+  const noToken = await fetch(`${server.httpUrl}/admin/reports`);
+  const wrongToken = await fetch(`${server.httpUrl}/admin/reports`, { headers: { Authorization: 'Bearer nope' } });
+  check(noToken.status === 401 && wrongToken.status === 401, 'the admin surface refuses missing and wrong tokens');
+
+  const listed = await fetch(`${server.httpUrl}/admin/reports`, { headers: { Authorization: `Bearer ${adminToken}` } });
+  const listedBody = (await listed.json()) as {
+    reports: Array<{ reporter: string; reported: string; category: string; comment: string | null }>;
+  };
+  check(
+    listed.ok &&
+      listedBody.reports.some(
+        (r) => r.reporter === 'frank' && r.reported === 'grace' && r.category === 'spam' && r.comment === 'e2e report',
+      ),
+    'the operator sees the report with its category and comment',
+  );
+
+  const ban = await fetch(`${server.httpUrl}/admin/ban`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ handle: 'grace' }),
+  });
+  check(ban.ok, 'the operator banned the reported handle');
+  await waitFor(() => grace.errors.includes('BANNED') && !grace.client.isConnected());
+  check(true, 'the ban kicked the live socket with BANNED');
+
+  const sendToBanned = await bob.client
+    .sendEnvelope('grace', {
+      id: randomUUID(),
+      ciphertext: Buffer.from('x').toString('base64'),
+      messageType: 'whisper',
+      sentAt: Date.now(),
+    })
+    .then(
+      () => null,
+      (e: Error) => e.message,
+    );
+  check(sendToBanned === 'NO_SUCH_HANDLE', 'a send to a banned handle answers NO_SUCH_HANDLE');
+
+  grace.errors.length = 0;
+  grace.client.start();
+  await waitFor(() => grace.errors.includes('BANNED'));
+  check(!grace.client.isConnected(), 'a banned handle cannot re-authenticate');
+
+  const unban = await fetch(`${server.httpUrl}/admin/unban`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${adminToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ handle: 'grace' }),
+  });
+  check(unban.ok, 'the operator unbanned the handle');
+  grace.client.stop();
+  await waitFor(() => !grace.client.isConnected());
+  grace.client.start();
+  await grace.client.ensureReady(8000);
+  check(grace.client.isConnected(), 'an unbanned handle authenticates again');
+
   alice.client.stop();
   bob.client.stop();
   dave.client.stop();
   erin.client.stop();
+  frank.client.stop();
+  grace.client.stop();
   server.stop();
 
   if (failures > 0) {
