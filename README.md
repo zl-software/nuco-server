@@ -135,21 +135,62 @@ No server configuration. The app registers an endpoint URL with its distributor 
 relay POSTs a tiny content free body to it. Endpoints are SSRF checked at registration and
 again before every send.
 
+## Moderation and reports
+
+Since protocol 3.2 a client can flag another handle to the operator with the `report`
+frame (authenticated socket, rate limited per IP). A report never contains message
+content, there is none to have: it carries the reporter and reported handles, a category
+(`spam` | `harassment` | `illegal` | `other`), an optional short comment, and an optional
+context marker. Reports land in a single `ReportsDO` Durable Object, one row per reporter
+and reported pair (a repeat report replaces the earlier one), capped by `REPORTS_MAX`.
+
+The operator surface is a set of bearer authenticated HTTP endpoints, mounted only when
+the `ADMIN_TOKEN` secret is set (without it every `/admin` path answers 404 and report
+frames are rejected, so a bare relay exposes nothing):
+
+```
+# generate and set a token (add --env production for the reference deployment)
+openssl rand -hex 32 | npx wrangler secret put ADMIN_TOKEN
+
+# list reports (newest first; paging via ?limit= and ?before=<id>)
+curl -H "Authorization: Bearer $TOKEN" https://relay.example.org/admin/reports
+
+# ban a handle: kicks its live socket, drops its queue, blocks authenticate and register
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"handle":"<handle>"}' https://relay.example.org/admin/ban
+
+# undo a ban
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"handle":"<handle>"}' https://relay.example.org/admin/unban
+
+# delete handled report rows
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"ids":[1,2]}' https://relay.example.org/admin/reports/delete
+```
+
+Ban semantics: a banned handle fails `authenticate` and `register` with error `BANNED`
+(on authenticate only after the signature verified, so ban status is not a probe for
+strangers), and a `send` to it answers `NO_SUCH_HANDLE`, indistinguishable from a deleted
+account. Report rows are the only who to whom relationship the relay ever persists; they
+are never logged.
+
 ## Configuration
 
 Vars (in `wrangler.jsonc`): `QUEUE_MAX` (1000), `QUEUE_TTL_SECONDS` (30 days),
 `RATE_MAX_PER_MIN` (600, per handle), `MAX_MESSAGE_BYTES` (131072), `TURN_TTL_SECONDS`
-(7200), `SOCKETS_MAX_PER_HANDLE` (8), `APNS_HOST`. Secrets (via `wrangler secret put`):
-`TURN_KEY_ID`, `TURN_KEY_SECRET`, `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`,
-`APNS_BUNDLE_ID`. APNs secrets are all four or none: a partial set is reported as
-`"apns": "partial"` on `/health` and pushes are skipped. The `DEV` and `TURN_TEST` vars
-exist only for `wrangler dev` and the tests; never set them on a deployment.
+(7200), `SOCKETS_MAX_PER_HANDLE` (8), `REPORTS_MAX` (10000), `APNS_HOST`. Secrets (via
+`wrangler secret put`): `TURN_KEY_ID`, `TURN_KEY_SECRET`, `APNS_KEY`, `APNS_KEY_ID`,
+`APNS_TEAM_ID`, `APNS_BUNDLE_ID`, `ADMIN_TOKEN`. APNs secrets are all four or none: a
+partial set is reported as `"apns": "partial"` on `/health` and pushes are skipped. The
+`DEV` and `TURN_TEST` vars exist only for `wrangler dev` and the tests; never set them on
+a deployment.
 
 Per IP abuse limits live in the `ratelimits` bindings in `wrangler.jsonc`: `REG_LIMIT`
-(new handle registrations per IP per minute, default 20) and `CONN_LIMIT` (WebSocket
-upgrades per IP per minute, default 300). Keys are hashed IPs, windows are sliding and
-per colo, nothing is persisted. Both are optional: a config without them fails open. On
-a custom domain you can add a zone level WAF rate limiting rule as a coarser outer wall.
+(new handle registrations per IP per minute, default 20), `CONN_LIMIT` (WebSocket
+upgrades per IP per minute, default 300), and `REPORT_LIMIT` (report submissions per IP
+per minute, default 5). Keys are hashed IPs, windows are sliding and per colo, nothing is
+persisted. All are optional: a config without them fails open. On a custom domain you can
+add a zone level WAF rate limiting rule as a coarser outer wall.
 
 ## Security notes
 
