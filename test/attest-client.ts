@@ -11,6 +11,7 @@
 import { WebSocket } from 'ws';
 
 import { generateIdentity, authPublicKeyBase64 } from '../../nuco-messenger/src/crypto/identity';
+import { NodeLibsignalBackend } from '../../nuco-messenger/src/crypto/backend-node';
 import { RelayClient, type WebSocketCtor } from '../../nuco-messenger/src/transport/relay';
 
 import { startDevServer } from './dev-server';
@@ -32,7 +33,9 @@ interface Outcome {
 }
 
 async function runClient(port: number, handle: string, withProvider: boolean): Promise<Outcome> {
-  const id = await generateIdentity();
+  // The identity key comes from the same official libsignal core the app uses; only the
+  // transport auth key matters here, but the signature requires a backend since 3.0.
+  const id = await generateIdentity(new NodeLibsignalBackend());
   const outcome: Outcome = { errors: [], providerChallenges: [], connected: false };
   const client = new RelayClient({
     url: `ws://127.0.0.1:${port}`,
