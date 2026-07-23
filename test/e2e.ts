@@ -5,7 +5,8 @@
 //   deterministic initiator runs PQXDH offline -> verify/confirm exchange with the card
 //   hash proof in both directions -> sealed text both ways -> call signaling -> the
 //   screenshot protection request/accept/cancel trio -> reply references and message
-//   deletion -> the profile/name rename announcement.
+//   deletion -> the profile/name rename announcement -> a chunked image with an offline
+//   gap mid transfer.
 // Also asserts the relay only ever holds ciphertext, that an offline recipient triggers a
 // content free push wake, and that a prekey envelope held unacked (the unknown sender
 // rule) survives at the relay and redelivers after a reconnect, exactly what the app does
@@ -44,10 +45,17 @@ import {
   KYBER_PREKEY_ID,
 } from '../../nuco-messenger/src/crypto/identity';
 import { NodeLibsignalBackend } from '../../nuco-messenger/src/crypto/backend-node';
-import { NucoSignal, type SessionBootstrap } from '../../nuco-messenger/src/crypto/signal';
+import { NucoSignal, DuplicateMessageError, type SessionBootstrap } from '../../nuco-messenger/src/crypto/signal';
 import { computeCardHash, isSessionInitiator } from '../../nuco-messenger/src/crypto/verification';
 import { NucoSignalStore, InMemoryKvBackend } from '../../nuco-messenger/src/crypto/store';
-import { utf8Encode, utf8Decode } from '../../nuco-messenger/src/crypto/bytes';
+import { utf8Encode, utf8Decode, bytesToBase64 } from '../../nuco-messenger/src/crypto/bytes';
+import {
+  assembleAndVerify,
+  chunkCountFor,
+  chunkEnvelopeId,
+  sha256B64OfB64,
+  splitB64,
+} from '../../nuco-messenger/src/services/image-codec';
 import { RelayClient, type WebSocketCtor } from '../../nuco-messenger/src/transport/relay';
 
 let failures = 0;
@@ -130,7 +138,18 @@ async function makeClient(port: number, handle: string, scanned = true): Promise
         me.heldPrekey += 1;
         return; // unacked on purpose: the relay must keep it queued
       }
-      const plaintext = await signal.decrypt(from, { ciphertext: envelope.ciphertext, messageType: envelope.messageType });
+      let plaintext: Uint8Array;
+      try {
+        plaintext = await signal.decrypt(from, { ciphertext: envelope.ciphertext, messageType: envelope.messageType });
+      } catch (err) {
+        // The app's duplicate rule: a redelivery whose ack was lost can never decrypt
+        // again (the message key is consumed); ack and drop so it stops redelivering.
+        if (err instanceof DuplicateMessageError) {
+          me.client.ack(envelope.id);
+          return;
+        }
+        throw err;
+      }
       me.received.push({ from, content: decodeContent(plaintext), sentAt: envelope.sentAt, receivedAt: Date.now() });
       me.client.ack(envelope.id);
     },
@@ -140,10 +159,17 @@ async function makeClient(port: number, handle: string, scanned = true): Promise
   return me;
 }
 
-async function sendSealed(sender: HeadlessClient, to: string, content: Parameters<typeof encodeContent>[0]): Promise<string> {
+// The optional id pins the envelope id (image chunks use deterministic ids derived from
+// the announcement id, exactly like the app).
+async function sendSealed(
+  sender: HeadlessClient,
+  to: string,
+  content: Parameters<typeof encodeContent>[0],
+  id?: string,
+): Promise<string> {
   const sealed = await sender.signal.encrypt(to, encodeContent(content));
   await sender.client.sendEnvelope(to, {
-    id: randomUUID(),
+    id: id ?? randomUUID(),
     ciphertext: sealed.ciphertext,
     messageType: sealed.messageType,
     sentAt: Date.now(),
@@ -342,6 +368,93 @@ async function main(): Promise<void> {
     'responder received the display name change',
   );
   check(!utf8Decode(Buffer.from(renameWire, 'base64')).includes('Alice Renamed'), 'the new name is opaque on the wire');
+
+  // Images (protocol 3.3): a photo travels as one announcement plus fixed geometry chunks,
+  // every envelope an ordinary sealed frame under the relay's default size cap. The
+  // receiver reassembles by ref and seq and verifies the announced digest.
+  const imageBytes = new Uint8Array(150000);
+  for (let i = 0; i < imageBytes.length; i++) imageBytes[i] = (i * 31 + 7) & 0xff;
+  const imageBody = bytesToBase64(imageBytes);
+  const imageSha = await sha256B64OfB64(imageBody);
+  const imageId = randomUUID();
+  const slices = splitB64(imageBody);
+  const baseCount = responder.received.length;
+  const metaWire = await sendSealed(
+    initiator,
+    responder.handle,
+    {
+      t: 'image',
+      mime: 'image/jpeg',
+      width: 1600,
+      height: 1200,
+      bytes: imageBytes.length,
+      sha256: imageSha,
+      chunks: chunkCountFor(imageBytes.length),
+    },
+    imageId,
+  );
+  const chunkWires: string[] = [];
+  for (let seq = 0; seq < slices.length; seq++) {
+    if (seq === 2) {
+      // The receiver drops offline mid transfer; the remaining chunks queue at the relay
+      // and the reconnect below drains them in order, resuming the assembly.
+      responder.client.stop();
+      await waitFor(() => !responder.client.isConnected());
+    }
+    chunkWires.push(await sendSealed(initiator, responder.handle, { t: 'image/chunk', ref: imageId, seq, data: slices[seq]! }, chunkEnvelopeId(imageId, seq)));
+  }
+  responder.client.start();
+  await waitFor(() => responder.received.length >= baseCount + 1 + slices.length, 10000);
+  const imageMeta = responder.received[baseCount];
+  check(
+    imageMeta?.content.t === 'image' && imageMeta.content.sha256 === imageSha && imageMeta.content.chunks === slices.length,
+    'responder received the image announcement (before any chunk)',
+  );
+  const receivedChunks = responder.received
+    .slice(baseCount + 1)
+    .map((r) => r.content)
+    .filter((c): c is Extract<DecodedContent, { t: 'image/chunk' }> => c.t === 'image/chunk' && c.ref === imageId)
+    .sort((a, b) => a.seq - b.seq)
+    .map((c) => c.data);
+  let assembled: string | null = null;
+  try {
+    assembled = await assembleAndVerify(receivedChunks, imageBytes.length, imageSha);
+  } catch {
+    assembled = null;
+  }
+  check(assembled === imageBody, 'the image reassembled across the offline gap and its digest verified');
+  check(
+    [metaWire, ...chunkWires].every((w) => w.length <= 131072),
+    'every image envelope fits the relay default size cap',
+  );
+  check(
+    !chunkWires.some((w) => w.includes(imageBody.slice(0, 48))),
+    'the image bytes are opaque on the wire',
+  );
+
+  // A chunk whose data violates the codec bounds (length not a multiple of 4) decodes as
+  // unknown on the receiver, the standard drop path for malformed content.
+  await sendSealed(initiator, responder.handle, { t: 'image/chunk', ref: imageId, seq: 0, data: 'AAAAA' });
+  await waitFor(() => responder.received.length >= baseCount + 2 + slices.length);
+  check(
+    responder.received[baseCount + 1 + slices.length]?.content.t === 'unknown',
+    'a malformed chunk decodes as unknown and is dropped',
+  );
+
+  // An envelope over MAX_MESSAGE_BYTES is refused by the relay with MESSAGE_TOO_LARGE
+  // (correlated, so the send itself rejects); the chunk geometry exists to stay under it.
+  let oversizeRejected = false;
+  try {
+    await initiator.client.sendEnvelope(responder.handle, {
+      id: randomUUID(),
+      ciphertext: 'A'.repeat(132000),
+      messageType: 'whisper',
+      sentAt: Date.now(),
+    });
+  } catch {
+    oversizeRejected = true;
+  }
+  check(oversizeRejected, 'an envelope over the relay size cap is refused');
 
   // Glare tiebreak is shared and antisymmetric, so both sides derive the same winner.
   check(callOfferWins('a-id', 'b-id') && !callOfferWins('b-id', 'a-id'), 'glare tiebreak is deterministic');
